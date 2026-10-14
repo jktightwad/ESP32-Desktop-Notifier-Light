@@ -477,9 +477,10 @@ static int scanWithBar(bool showBar, uint32_t ms=10000){
   }
   return n;
 }
-// Tries known networks in range, strongest first: blue bar while scanning, orange while
+// Tries known networks in range, strongest first, then the ones the scan didn't see
+// (hidden networks never show up in a scan). Blue bar while scanning, orange while
 // joining each one. showBar=false leaves the current effect alone (used from loop()).
-static bool tryKnownNetworks(bool showBar=true, uint32_t msEach=15000){
+static bool tryKnownNetworks(bool showBar=true, uint32_t msEach=15000, uint32_t msUnseen=8000){
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WiFi] Already connected: %s | IP:%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     rememberCurrentNetwork(); return true;
@@ -492,24 +493,28 @@ static bool tryKnownNetworks(bool showBar=true, uint32_t msEach=15000){
   int found = scanWithBar(showBar);
   if (found < 0) Serial.println("[WiFi] Scan failed.");
 
-  struct InRange { size_t idx; int rssi; };
-  std::vector<InRange> inRange;
+  const int UNSEEN = -1000;
+  struct Candidate { size_t idx; int rssi; };
+  std::vector<Candidate> cands;
   for (size_t k=0; k<known.size(); ++k){
-    int best = -1000;
+    int best = UNSEEN;
     for (int i=0; i<found; ++i) if (WiFi.SSID(i) == known[k].ssid && WiFi.RSSI(i) > best) best = WiFi.RSSI(i);
-    if (best > -1000) inRange.push_back({k, best});
+    cands.push_back({k, best});
   }
   WiFi.scanDelete();
-  std::sort(inRange.begin(), inRange.end(), [](const InRange& a, const InRange& b){ return a.rssi > b.rssi; });
-  if (found >= 0 && inRange.empty()) Serial.println("[WiFi] No known network in range.");
+  // Seen networks strongest first; unseen ones keep list order (most recent first) at the end.
+  std::stable_sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b){ return a.rssi > b.rssi; });
 
-  for (const InRange& c : inRange){
+  for (const Candidate& c : cands){
     const WifiCred& n = known[c.idx];
-    Serial.printf("[WiFi] Trying \"%s\" (%d dBm)...\n", n.ssid.c_str(), c.rssi);
+    const bool seen = c.rssi != UNSEEN;
+    const uint32_t ms = seen ? msEach : msUnseen;
+    if (seen) Serial.printf("[WiFi] Trying \"%s\" (%d dBm)...\n", n.ssid.c_str(), c.rssi);
+    else      Serial.printf("[WiFi] Trying \"%s\" (not seen in scan, may be hidden)...\n", n.ssid.c_str());
     WiFi.begin(n.ssid.c_str(), n.pass.c_str());
     uint32_t s=millis();
-    while(WiFi.status()!=WL_CONNECTED && millis()-s<msEach){
-      if (showBar) drawProgressBarAndDelay(RGB(255,128,0), s, msEach); else delay(120);
+    while(WiFi.status()!=WL_CONNECTED && millis()-s<ms){
+      if (showBar) drawProgressBarAndDelay(RGB(255,128,0), s, ms); else delay(120);
     }
     if (WiFi.status()==WL_CONNECTED){
       Serial.printf("[WiFi] Connected: %s | IP:%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
