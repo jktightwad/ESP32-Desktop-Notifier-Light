@@ -21,7 +21,10 @@
 #include <ArduinoOTA.h>
 #include <ElegantOTA.h>
 #include <math.h>
+#include <algorithm>
+#include <esp_wifi.h>
 #include <secrets.h>
+#include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
 #define FIRMWARE_VERSION   "1.8.4-c3"
@@ -429,43 +432,119 @@ static void showPortalStaticPurple(bool on){
     strip.show();
   }
 }
-static bool tryStored(uint32_t ms=20000){
-  Serial.println("[WiFi] Trying stored credentials...");
-  statusActive = true;
-  WiFi.mode(WIFI_STA); WiFi.persistent(true); WiFi.setAutoConnect(true); WiFi.setAutoReconnect(true); WiFi.setSleep(false);
+// Known networks: the ones this device has joined (/wifi.txt, most recent first),
+// then any listed in secrets.h (WIFI_NETWORKS and/or PRIMARY_WIFI_SSID).
+#ifdef WIFI_NETWORKS
+struct BuiltinNet { const char* ssid; const char* pass; };
+static const BuiltinNet BUILTIN_NETWORKS[] = WIFI_NETWORKS;
+#endif
+static WifiStore wifiStore;
+
+static void addKnown(std::vector<WifiCred>& v, const String& ssid, const String& pass){
+  if (!ssid.length()) return;
+  for (const WifiCred& k : v) if (k.ssid == ssid) return;
+  v.push_back({ssid, pass});
+}
+static std::vector<WifiCred> knownNetworks(){
+  std::vector<WifiCred> v = wifiStore.networks();
+#ifdef WIFI_NETWORKS
+  for (const BuiltinNet& n : BUILTIN_NETWORKS) addKnown(v, n.ssid, n.pass);
+#endif
+#ifdef PRIMARY_WIFI_SSID
+  addKnown(v, PRIMARY_WIFI_SSID, PRIMARY_WIFI_PASS);
+#endif
+  return v;
+}
+// The network the ESP32 saved itself (earlier firmware or the portal), copied into the list.
+static void importEspSavedNetwork(){
+  wifi_config_t conf;
+  if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return;
+  String ssid = String((const char*)conf.sta.ssid);
+  if (!ssid.length()) return;
+  for (const WifiCred& n : wifiStore.networks()) if (n.ssid == ssid) return;
+  wifiStore.remember(ssid, String((const char*)conf.sta.password));
+}
+static void rememberCurrentNetwork(){
+  if (WiFi.status()==WL_CONNECTED) wifiStore.remember(WiFi.SSID(), WiFi.psk());
+}
+// Background scan so the blue bar keeps moving. Returns networks found, or <0 on failure.
+static int scanWithBar(bool showBar, uint32_t ms=10000){
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true);
+  uint32_t s=millis(); int n;
+  while ((n = WiFi.scanComplete()) == WIFI_SCAN_RUNNING && millis()-s<ms){
+    if (showBar) drawProgressBarAndDelay(RGB(0,0,255), s, ms); else delay(50);
+  }
+  return n;
+}
+// Tries known networks in range, strongest first: blue bar while scanning, orange while
+// joining each one. showBar=false leaves the current effect alone (used from loop()).
+static bool tryKnownNetworks(bool showBar=true, uint32_t msEach=15000){
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WiFi] Already connected: %s | IP:%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-    setAllPixels(0); statusActive = false; return true;
+    rememberCurrentNetwork(); return true;
   }
-  WiFi.begin();
-  uint32_t s=millis();
-  while(WiFi.status()!=WL_CONNECTED && millis()-s<ms){ drawProgressBarAndDelay(RGB(0,0,255), s, ms); yield(); }
-  if (WiFi.status()!=WL_CONNECTED) drawProgressBar(RGB(0,0,255), 1.0f);
-  Serial.println();
-  if (WiFi.status()==WL_CONNECTED){
-    Serial.printf("[WiFi] Connected: %s | IP:%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-    setAllPixels(0); statusActive = false; return true;
+  std::vector<WifiCred> known = knownNetworks();
+  if (known.empty()){ Serial.println("[WiFi] No known networks."); return false; }
+  if (showBar) statusActive = true;
+  Serial.printf("[WiFi] Scanning for %u known network(s)...\n", (unsigned)known.size());
+  WiFi.disconnect();   // stop any auto-connect attempt so the scan can run
+  int found = scanWithBar(showBar);
+  if (found < 0) Serial.println("[WiFi] Scan failed.");
+
+  struct InRange { size_t idx; int rssi; };
+  std::vector<InRange> inRange;
+  for (size_t k=0; k<known.size(); ++k){
+    int best = -1000;
+    for (int i=0; i<found; ++i) if (WiFi.SSID(i) == known[k].ssid && WiFi.RSSI(i) > best) best = WiFi.RSSI(i);
+    if (best > -1000) inRange.push_back({k, best});
   }
-  Serial.println("[WiFi] Stored creds failed."); setAllPixels(0); statusActive = false; return false;
+  WiFi.scanDelete();
+  std::sort(inRange.begin(), inRange.end(), [](const InRange& a, const InRange& b){ return a.rssi > b.rssi; });
+  if (found >= 0 && inRange.empty()) Serial.println("[WiFi] No known network in range.");
+
+  for (const InRange& c : inRange){
+    const WifiCred& n = known[c.idx];
+    Serial.printf("[WiFi] Trying \"%s\" (%d dBm)...\n", n.ssid.c_str(), c.rssi);
+    WiFi.begin(n.ssid.c_str(), n.pass.c_str());
+    uint32_t s=millis();
+    while(WiFi.status()!=WL_CONNECTED && millis()-s<msEach){
+      if (showBar) drawProgressBarAndDelay(RGB(255,128,0), s, msEach); else delay(120);
+    }
+    if (WiFi.status()==WL_CONNECTED){
+      Serial.printf("[WiFi] Connected: %s | IP:%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+      rememberCurrentNetwork();
+      if (showBar){ setAllPixels(0); statusActive = false; }
+      return true;
+    }
+    Serial.printf("[WiFi] \"%s\" failed.\n", n.ssid.c_str());
+    WiFi.disconnect();
+  }
+  if (showBar){ setAllPixels(0); statusActive = false; }
+  return false;
 }
-static bool tryPrimary(uint32_t ms=15000){
-  Serial.printf("[WiFi] Trying PRIMARY: \"%s\"...\n", PRIMARY_WIFI_SSID);
-  statusActive = true;
-  WiFi.begin(PRIMARY_WIFI_SSID, PRIMARY_WIFI_PASS);
-  uint32_t s=millis();
-  while(WiFi.status()!=WL_CONNECTED && millis()-s<ms){ drawProgressBarAndDelay(RGB(255,128,0), s, ms); }
-  if (WiFi.status()!=WL_CONNECTED) drawProgressBar(RGB(255,128,0), 1.0f);
-  Serial.println();
-  if (WiFi.status()==WL_CONNECTED){
-    Serial.printf("[WiFi] Connected PRIMARY | IP:%s\n", WiFi.localIP().toString().c_str());
-    setAllPixels(0); statusActive = false; return true;
+// From loop(): saves networks joined later, and if Wi-Fi stays down, looks for any
+// other known network once a minute (e.g. the device was carried to another site).
+static void serviceWifi(){
+  static bool wasConnected = true;
+  static uint32_t lostAtMs = 0, lastRetryMs = 0;
+  if (!(WiFi.getMode() & WIFI_STA)) return;   // OTA recovery runs AP-only
+  bool connected = WiFi.status()==WL_CONNECTED;
+  if (connected != wasConnected){
+    wasConnected = connected;
+    if (connected) rememberCurrentNetwork();
+    else { Serial.println("[WiFi] Disconnected."); lostAtMs = millis(); }
   }
-  Serial.println("[WiFi] PRIMARY failed."); setAllPixels(0); statusActive = false; return false;
+  if (!connected && millis()-lostAtMs > 60000 && millis()-lastRetryMs > 60000){
+    lastRetryMs = millis();
+    Serial.println("[WiFi] Still down - scanning for known networks");
+    tryKnownNetworks(false);
+  }
 }
 static void afterConnectAnnounce(){ startEphemeralAPWithStaIP(60000); }
 static void connectWithFallbacks(){
-  if (tryStored()){ afterConnectAnnounce(); return; }
-  if (tryPrimary()){ afterConnectAnnounce(); return; }
+  importEspSavedNetwork();
+  if (tryKnownNetworks()){ afterConnectAnnounce(); return; }
   WiFi.softAPdisconnect(true); apRunning = false;
   Serial.println("[WiFi] Launching Config Portal (OPEN, WiFiManager)...");
   wm.setConfigPortalTimeout(300);
@@ -475,6 +554,7 @@ static void connectWithFallbacks(){
   if (ok){
     setAllPixels(RGB(0,255,0)); delay(120); setAllPixels(0);
     Serial.printf("[WiFi] Connected via portal. SSID=%s IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    rememberCurrentNetwork();
     afterConnectAnnounce();
   } else {
     Serial.println("[WiFi] Portal timeout.");
@@ -492,6 +572,7 @@ static void startConfigPortalOnly(){
   if (ok){
     setAllPixels(RGB(0,255,0)); delay(120); setAllPixels(0);
     Serial.printf("[WiFi] Connected via portal. SSID=%s IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    rememberCurrentNetwork();
     afterConnectAnnounce();
   } else {
     Serial.println("[WiFi] Portal timeout.");
@@ -1013,6 +1094,7 @@ static void handleSetEffect(){
 static void handleForgetWifi(){
   server.send(200,"text/plain","Forgetting Wi-Fi and rebooting...");
   File f = LittleFS.open(FORGET_FILE, "w"); if (f) { f.println("1"); f.close(); }
+  wifiStore.clear();   // networks in secrets.h are still tried
   WiFi.mode(WIFI_STA); WiFi.persistent(true);
   WiFi.setAutoConnect(false); WiFi.setAutoReconnect(false);
   WiFi.disconnect(true, true);
@@ -1076,6 +1158,7 @@ void setup(){
     loadGroups();
     loadHardwareCfg();
     loadLastMsg();
+    wifiStore.load();
   } else {
     Serial.println("[BOOT] LittleFS mount FAILED");
   }
@@ -1147,6 +1230,7 @@ void setup(){
  
 void loop(){
   server.handleClient();
+  serviceWifi();
   ensureMqtt();
   mqtt.loop();
   ArduinoOTA.handle();
