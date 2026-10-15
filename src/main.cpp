@@ -1,12 +1,12 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.8.8-c3
+// Version: 1.8.9-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off; 1/2/3 taps + hold = cycle
 //    fun modes / presence / fast comet colours, release keeps
 //  - Touch/buzzer timings editable on /advanced (saved to /touch.txt)
-//  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO {"beep":n}
+//  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO "beep" (count, {count,on,off}, or [ms,...])
 //  - Keeps: AIO instant re-subscribe, LED Gap, Last AIO msg, OTA, etc.
 // =====================================================================
 
@@ -32,7 +32,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.8.8-c3"
+#define FIRMWARE_VERSION   "1.8.9-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -54,6 +54,8 @@
 // Beep timing runs on an esp_timer, so it stays short even if loop() is blocked.
 #define BUZZER_PIN         7
 #define DEFAULT_BEEP_MS    15         // on/off and cycle confirm (0 = silent)
+#define BEEP_MAX_STEPS     32         // longest pattern (on/off steps) from AIO
+#define BEEP_MAX_STEP_MS   2000       // longest single on or off step
 
 
 // ---------------------- Adafruit IO (AIO) -----------------------------
@@ -131,6 +133,7 @@ unsigned long lastHeartbeatMs = 0;
 static bool statusActive = false;
 static bool discoveryBlinkActive = false;
 static void beep(uint8_t count=1, uint16_t onMs=60, uint16_t offMs=80);   // buzzer, defined below
+static void beepPattern(const uint16_t* ms, uint8_t n);
  
 // ---------------------- Helpers --------------------------------------
 static inline uint32_t RGB(uint8_t r,uint8_t g,uint8_t b){ return strip.Color(r,g,b); }
@@ -737,7 +740,26 @@ static void applyCommand(const JsonObject& obj, const String& srcTopic, const St
   if (!isTargeted(obj)) return;
   recordLastMsg(srcTopic, rawPayload);
   stopDiscoveryBlink(true);
-  if (obj["beep"].is<int>()) beep((uint8_t)constrain((int)obj["beep"], 1, 10), 120, 120);
+  // "beep": 3                                -> 3 beeps, 120ms on / 120ms off
+  // "beep": {"count":3, "on":50, "off":200}   -> any field optional (defaults 1 / 120 / 120)
+  // "beep": [200, 100, 50, 100, 50]           -> pattern in ms: on, off, on, off, on ...
+  if (obj["beep"].is<int>()){
+    beep((uint8_t)constrain((int)obj["beep"], 1, 16), 120, 120);
+  } else if (obj["beep"].is<JsonObjectConst>()){
+    JsonObjectConst b = obj["beep"].as<JsonObjectConst>();
+    int cnt = b["count"].is<int>() ? (int)b["count"] : 1;
+    int on  = b["on"].is<int>()    ? (int)b["on"]    : 120;
+    int off = b["off"].is<int>()   ? (int)b["off"]   : 120;
+    beep((uint8_t)constrain(cnt, 1, 16), (uint16_t)constrain(on, 1, BEEP_MAX_STEP_MS),
+         (uint16_t)constrain(off, 1, BEEP_MAX_STEP_MS));
+  } else if (obj["beep"].is<JsonArrayConst>()){
+    uint16_t seq[BEEP_MAX_STEPS]; uint8_t n = 0;
+    for (JsonVariantConst v : obj["beep"].as<JsonArrayConst>()){
+      if (n >= BEEP_MAX_STEPS) break;
+      if (v.is<int>()) seq[n++] = (uint16_t)constrain((int)v, 1, BEEP_MAX_STEP_MS);
+    }
+    beepPattern(seq, n);
+  }
  
   if (obj["brightness"].is<int>()){
     int br = constrain((int)obj["brightness"],0,100);
@@ -1264,22 +1286,17 @@ static void handleSaveHardware(){
 }
  
 // ---------------------- Buzzer (TDB05LFPN) ----------------------------
-// beep(count,onMs,offMs) runs the pattern from an esp_timer callback.
+// A pattern is a list of durations in ms: on, off, on, off, ... (starts with on).
+// It is played from an esp_timer callback, so timing doesn't depend on loop().
 static esp_timer_handle_t buzzTimer = nullptr;
-static volatile uint8_t  buzzLeft  = 0;
-static volatile uint16_t buzzOnMs  = 0, buzzOffMs = 0;
-static volatile bool     buzzOn    = false;
+static volatile uint16_t buzzSeq[BEEP_MAX_STEPS];
+static volatile uint8_t  buzzLen = 0, buzzPos = 0;
 
-static void buzzerWrite(bool on){ digitalWrite(BUZZER_PIN, on ? HIGH : LOW); buzzOn = on; }
+static void buzzerWrite(bool on){ digitalWrite(BUZZER_PIN, on ? HIGH : LOW); }
 static void buzzTimerCb(void*){
-  if (buzzOn){
-    buzzerWrite(false);
-    if (buzzLeft) --buzzLeft;
-    if (buzzLeft) esp_timer_start_once(buzzTimer, (uint64_t)buzzOffMs * 1000ULL);
-  } else if (buzzLeft){
-    buzzerWrite(true);
-    esp_timer_start_once(buzzTimer, (uint64_t)buzzOnMs * 1000ULL);
-  }
+  if (++buzzPos >= buzzLen){ buzzerWrite(false); return; }
+  buzzerWrite((buzzPos & 1) == 0);   // even steps = on
+  esp_timer_start_once(buzzTimer, (uint64_t)buzzSeq[buzzPos] * 1000ULL);
 }
 static void buzzerInit(){
   pinMode(BUZZER_PIN, OUTPUT); buzzerWrite(false);
@@ -1287,12 +1304,24 @@ static void buzzerInit(){
                                       .dispatch_method = ESP_TIMER_TASK, .name = "buzz" };
   esp_timer_create(&a, &buzzTimer);
 }
-static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
-  if (!count || !buzzTimer) return;
+// Plays ms[0..n-1] (on, off, on, ...). Replaces any pattern already playing.
+static void beepPattern(const uint16_t* ms, uint8_t n){
+  if (!buzzTimer || !n) return;
   esp_timer_stop(buzzTimer);
-  buzzLeft = count; buzzOnMs = onMs; buzzOffMs = offMs;
+  if (n > BEEP_MAX_STEPS) n = BEEP_MAX_STEPS;
+  for (uint8_t i=0; i<n; ++i) buzzSeq[i] = constrain(ms[i], (uint16_t)1, (uint16_t)BEEP_MAX_STEP_MS);
+  buzzLen = n; buzzPos = 0;
   buzzerWrite(true);
-  esp_timer_start_once(buzzTimer, (uint64_t)onMs * 1000ULL);
+  esp_timer_start_once(buzzTimer, (uint64_t)buzzSeq[0] * 1000ULL);
+}
+static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
+  if (!count || !onMs) return;
+  uint16_t seq[BEEP_MAX_STEPS]; uint8_t n = 0;
+  for (uint8_t i=0; i<count && n+1<BEEP_MAX_STEPS; ++i){
+    if (i) seq[n++] = offMs ? offMs : 1;
+    seq[n++] = onMs;
+  }
+  beepPattern(seq, n);
 }
 
 // ---------------------- Touch (HW-139) -------------------------------
