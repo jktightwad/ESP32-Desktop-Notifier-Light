@@ -1,6 +1,6 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.9.1-c3
+// Version: 1.9.2-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off; 1/2/3 taps + hold = cycle
@@ -34,7 +34,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.9.1-c3"
+#define FIRMWARE_VERSION   "1.9.2-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -146,6 +146,7 @@ static void beepPattern(const uint16_t* ms, uint8_t n);
 #define POLL_WINDOW_MAX_S     120
 #define CHECKIN_GROUP         "checkin"
 #define ROSTER_MAX            40
+#define POLL_COOLDOWN_MS      60000UL   // web Poll button: at most one poll (from any device) per minute
 static bool     pongPending = false;
 static uint32_t pongAtMs    = 0;
 static String   pongId;
@@ -1000,7 +1001,10 @@ static bool sendPoll(int windowS){
   if (!mqtt.connected()) return false;
   JsonDocument d;
   d["group"] = "all";
-  String id = String("w") + String(millis() / 1000UL);
+  // Unique per poller: last 3 MAC bytes + seconds since boot.
+  char id[24];
+  snprintf(id, sizeof(id), "%06lX-%lu", (unsigned long)(ESP.getEfuseMac() >> 24) & 0xFFFFFFUL,
+           (unsigned long)(millis() / 1000UL));
   JsonObject pl = d["poll"].to<JsonObject>();
   pl["id"] = id; pl["window"] = windowS;
   String out; serializeJson(d, out);
@@ -1470,6 +1474,11 @@ static void handleOtaRecovery(){
   delay(300); ESP.restart();
 }
 static void handlePollNow(){
+  // Every poll costs one AIO data point per device; skip if any poller just ran one.
+  if (lastPollMs && (millis() - lastPollMs) < POLL_COOLDOWN_MS){
+    server.send(429,"text/plain","A poll ran less than a minute ago - wait, then refresh the main page.");
+    return;
+  }
   if (!sendPoll(POLL_WINDOW_DEFAULT_S)){ server.send(503,"text/plain","Adafruit IO not connected."); return; }
   server.sendHeader("Location","/"); server.send(302);
 }
