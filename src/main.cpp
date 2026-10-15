@@ -1,12 +1,13 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.8.9-c3
+// Version: 1.9.0-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off; 1/2/3 taps + hold = cycle
 //    fun modes / presence / fast comet colours, release keeps
 //  - Touch/buzzer timings editable on /advanced (saved to /touch.txt)
 //  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO "beep" (count, {count,on,off}, or [ms,...])
+//  - AIO "poll": devices reply "onair-pong" on the devices feed (find offline units)
 //  - Keeps: AIO instant re-subscribe, LED Gap, Last AIO msg, OTA, etc.
 // =====================================================================
 
@@ -32,7 +33,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.8.9-c3"
+#define FIRMWARE_VERSION   "1.9.0-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -134,6 +135,14 @@ static bool statusActive = false;
 static bool discoveryBlinkActive = false;
 static void beep(uint8_t count=1, uint16_t onMs=60, uint16_t offMs=80);   // buzzer, defined below
 static void beepPattern(const uint16_t* ms, uint8_t n);
+
+// Poll / pong: {"group":"all","poll":"abc"} -> each targeted device replies on
+// the devices feed after a random delay (spreads replies under AIO rate limits).
+#define POLL_WINDOW_DEFAULT_S 10
+#define POLL_WINDOW_MAX_S     120
+static bool     pongPending = false;
+static uint32_t pongAtMs    = 0;
+static String   pongId;
  
 // ---------------------- Helpers --------------------------------------
 static inline uint32_t RGB(uint8_t r,uint8_t g,uint8_t b){ return strip.Color(r,g,b); }
@@ -738,6 +747,24 @@ static void recordLastMsg(const String& topic, const String& payload){
 }
 static void applyCommand(const JsonObject& obj, const String& srcTopic, const String& rawPayload){
   if (!isTargeted(obj)) return;
+
+  // "poll": "<id>" | true | {"id":"<id>","window":<seconds>}
+  if (!obj["poll"].isNull()){
+    int window = POLL_WINDOW_DEFAULT_S;
+    pongId = "";
+    if (obj["poll"].is<const char*>()) pongId = obj["poll"].as<const char*>();
+    else if (obj["poll"].is<JsonObjectConst>()){
+      JsonObjectConst pl = obj["poll"].as<JsonObjectConst>();
+      if (pl["id"].is<const char*>()) pongId = pl["id"].as<const char*>();
+      if (pl["window"].is<int>())     window = constrain((int)pl["window"], 0, POLL_WINDOW_MAX_S);
+    }
+    pongAtMs = millis() + (window ? (uint32_t)random(0, window * 1000L) : 0);
+    pongPending = true;
+    Serial.printf("[AIO] Poll \"%s\": reply in %lums\n", pongId.c_str(), (unsigned long)(pongAtMs - millis()));
+    // A poll-only message doesn't count as a command (keeps "Last AIO msg" and the light as they are).
+    if (obj["mode"].isNull() && obj["color"].isNull() && obj["brightness"].isNull() &&
+        obj["speed"].isNull() && obj["beep"].isNull()) return;
+  }
   recordLastMsg(srcTopic, rawPayload);
   stopDiscoveryBlink(true);
   // "beep": 3                                -> 3 beeps, 120ms on / 120ms off
@@ -858,6 +885,30 @@ static void announceDevice(){
   Serial.printf("[AIO] Announce %s: %s\n", ok ? "sent" : "FAILED", out.c_str());
 }
  
+static void sendPong(){
+  JsonDocument d;
+  d["type"]     = "onair-pong";
+  d["poll"]     = pongId;
+  d["name"]     = deviceName;
+  d["deviceId"] = aioDeviceId;
+  d["ip"]       = WiFi.localIP().toString();
+  d["mac"]      = macString();
+  d["fw"]       = FIRMWARE_VERSION;
+  d["uptime"]   = millis() / 1000UL;
+  d["rssi"]     = WiFi.RSSI();
+  d["mode"]     = powerState ? getEffectName() : String("Off");
+  JsonArray g = d["groups"].to<JsonArray>();
+  for (auto &x : groups) g.add(x);
+  String out; serializeJson(d, out);
+  String topic = aioTopic(AIO_FEED_DEVICES);
+  bool ok = mqtt.publish(topic.c_str(), out.c_str());
+  Serial.printf("[AIO] Pong %s: %s\n", ok ? "sent" : "FAILED", out.c_str());
+}
+static void servicePong(){
+  if (!pongPending || (long)(millis() - pongAtMs) < 0 || !mqtt.connected()) return;
+  pongPending = false;
+  sendPong();
+}
 static void mqttBumpBackoff(){
   unsigned long next = mqttBackoffMs * 2UL;
   mqttBackoffMs = (next > MQTT_BACKOFF_MAX) ? MQTT_BACKOFF_MAX : next;
@@ -1536,6 +1587,7 @@ void loop(){
   serviceWifi();
   ensureMqtt();
   mqtt.loop();
+  servicePong();
   ArduinoOTA.handle();
   serviceTouch();
  
