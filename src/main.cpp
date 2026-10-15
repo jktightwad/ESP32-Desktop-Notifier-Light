@@ -1,8 +1,10 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.8.4-c3
+// Version: 1.8.5-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
+//  - HW-139 touch on GPIO10: tap = on/off, hold = cycle presence
+//  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO {"beep":n}
 //  - Keeps: AIO instant re-subscribe, LED Gap, Last AIO msg, OTA, etc.
 // =====================================================================
 
@@ -27,10 +29,25 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.8.4-c3"
+#define FIRMWARE_VERSION   "1.8.5-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
+
+// HW-139 (TTP223) touch module: SIG -> GPIO10, VCC -> 3V3, GND -> GND.
+// GPIO10 avoids the C3 strapping pins (2/8/9) and the UART0 pins (20/21).
+// Module default (jumpers open) = momentary, HIGH while touched.
+#define TOUCH_PIN          10
+#define TOUCH_ACTIVE       HIGH
+#define TOUCH_DEBOUNCE_MS  30
+#define TOUCH_LONG_MS      800        // hold this long = cycle presence
+
+// TDB05LFPN magnetic buzzer (5V / ~30mA) on GPIO7 via NPN transistor (not direct).
+// Driven with a 2300Hz square wave, which sounds whether or not the part has an
+// internal oscillator. If yours is self-drive and sounds rough, set BUZZER_SELF_DRIVE 1.
+#define BUZZER_PIN         7
+#define BUZZER_FREQ_HZ     2300
+#define BUZZER_SELF_DRIVE  0
 
 
 // ---------------------- Adafruit IO (AIO) -----------------------------
@@ -98,6 +115,7 @@ uint32_t apOffAtMs = 0;
 unsigned long lastHeartbeatMs = 0;
 static bool statusActive = false;
 static bool discoveryBlinkActive = false;
+static void beep(uint8_t count=1, uint16_t onMs=60, uint16_t offMs=80);   // buzzer, defined below
  
 // ---------------------- Helpers --------------------------------------
 static inline uint32_t RGB(uint8_t r,uint8_t g,uint8_t b){ return strip.Color(r,g,b); }
@@ -666,6 +684,7 @@ static void applyCommand(const JsonObject& obj, const String& srcTopic, const St
   if (!isTargeted(obj)) return;
   recordLastMsg(srcTopic, rawPayload);
   stopDiscoveryBlink(true);
+  if (obj["beep"].is<int>()) beep((uint8_t)constrain((int)obj["beep"], 1, 10), 120, 120);
  
   if (obj["brightness"].is<int>()){
     int br = constrain((int)obj["brightness"],0,100);
@@ -1150,8 +1169,90 @@ static void handleSaveHardware(){
   delay(300); ESP.restart();
 }
  
+// ---------------------- Buzzer (TDB05LFPN) ----------------------------
+// Non-blocking: beep(count,onMs,offMs) queues a pattern, serviceBuzzer() runs it.
+static uint8_t  buzzLeft  = 0;
+static uint16_t buzzOnMs  = 0, buzzOffMs = 0;
+static bool     buzzOn    = false;
+static uint32_t buzzNextMs = 0;
+
+static void buzzerWrite(bool on){
+#if BUZZER_SELF_DRIVE
+  digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
+#else
+  if (on) tone(BUZZER_PIN, BUZZER_FREQ_HZ); else noTone(BUZZER_PIN);
+#endif
+  buzzOn = on;
+}
+static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
+  if (!count) return;
+  buzzLeft = count; buzzOnMs = onMs; buzzOffMs = offMs;
+  buzzerWrite(true); buzzNextMs = millis() + onMs;
+}
+static void serviceBuzzer(){
+  if (!buzzOn && !buzzLeft) return;
+  if ((long)(millis() - buzzNextMs) < 0) return;
+  if (buzzOn){
+    buzzerWrite(false);
+    if (buzzLeft) --buzzLeft;
+    buzzNextMs = millis() + buzzOffMs;
+  } else if (buzzLeft){
+    buzzerWrite(true); buzzNextMs = millis() + buzzOnMs;
+  }
+}
+
+// ---------------------- Touch (HW-139) -------------------------------
+// Tap: toggle power (restores the last effect/color).
+// Hold >= TOUCH_LONG_MS: cycle presence Available -> Busy -> Away.
+static effect   lastOnEffect   = SOLID;
+static uint8_t  touchPresence  = 0;
+static bool     touchStable    = false;   // debounced state
+static bool     touchRaw       = false;
+static uint32_t touchRawMs     = 0;
+static uint32_t touchDownMs    = 0;
+static bool     touchLongDone  = false;
+
+static void touchTogglePower(){
+  stopDiscoveryBlink(true);
+  if (powerState && currentEffect!=OFF){
+    lastOnEffect = currentEffect;
+    currentEffect = OFF; powerState = false; setAllPixels(0);
+  } else {
+    currentEffect = (lastOnEffect==OFF) ? SOLID : lastOnEffect;
+    effectPosition = 0; effectDirection = 1;
+    if (currentEffect==PULSE) pulseResetRequested = true;
+    powerState = true;
+    if (currentEffect==SOLID) setAllPixels(currentColor);
+  }
+  beep(1, 40);
+  Serial.printf("[TOUCH] tap -> %s\n", getEffectName().c_str());
+}
+static void touchCyclePresence(){
+  static const char* const P[] = { "available", "busy", "away" };
+  stopDiscoveryBlink(true);
+  applyPresence(P[touchPresence]);
+  beep(touchPresence + 1, 40, 90);   // 1 = available, 2 = busy, 3 = away
+  Serial.printf("[TOUCH] hold -> %s\n", P[touchPresence]);
+  touchPresence = (touchPresence + 1) % 3;
+}
+static void serviceTouch(){
+  const uint32_t now = millis();
+  const bool raw = (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE);
+  if (raw != touchRaw){ touchRaw = raw; touchRawMs = now; }
+  if (raw != touchStable && (now - touchRawMs) >= TOUCH_DEBOUNCE_MS){
+    touchStable = raw;
+    if (touchStable){ touchDownMs = now; touchLongDone = false; }
+    else if (!touchLongDone) touchTogglePower();
+  }
+  if (touchStable && !touchLongDone && (now - touchDownMs) >= TOUCH_LONG_MS){
+    touchLongDone = true;
+    touchCyclePresence();
+  }
+}
+
 // ---------------------- Setup / Loop ---------------------------------
 void setup(){
+  pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);   // buzzer silent ASAP
   delay(200);
   Serial.begin(115200);
   uint32_t t0 = millis(); while (!Serial && (millis()-t0)<2500) delay(10);
@@ -1169,6 +1270,8 @@ void setup(){
   }
  
   initStrip();
+  // Pulldown keeps the pin LOW if the module is unplugged (module drives it when present)
+  pinMode(TOUCH_PIN, INPUT_PULLDOWN);
   currentColor = RGB(255,0,0);
   setAllPixels(0);
   float tempV; rgbToHsv(currentColor, targetHue, targetSaturation, tempV);
@@ -1239,6 +1342,8 @@ void loop(){
   ensureMqtt();
   mqtt.loop();
   ArduinoOTA.handle();
+  serviceTouch();
+  serviceBuzzer();
  
   if (!statusActive){
     switch (currentEffect){
