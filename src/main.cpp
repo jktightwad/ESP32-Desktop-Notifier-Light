@@ -134,6 +134,14 @@ static inline void setAllPixels(uint32_t col){
   for(int i=0;i<strip.numPixels();++i) strip.setPixelColor(i,col);
   strip.show();
 }
+// WiFi.setAutoConnect() was removed in Arduino-ESP32 core 3.x; no-op there.
+static inline void wifiSetAutoConnect(bool on){
+#if !defined(ESP_ARDUINO_VERSION_MAJOR) || ESP_ARDUINO_VERSION_MAJOR < 3
+  WiFi.setAutoConnect(on);
+#else
+  (void)on;
+#endif
+}
 static String macString(){
   uint64_t mac = ESP.getEfuseMac();
   uint8_t m[6] = {(uint8_t)(mac>>40),(uint8_t)(mac>>32),(uint8_t)(mac>>24),(uint8_t)(mac>>16),(uint8_t)(mac>>8),(uint8_t)mac};
@@ -586,7 +594,7 @@ static void connectWithFallbacks(){
 static void startConfigPortalOnly(){
   Serial.println("[WiFi] Forget flag present — starting Config Portal (OPEN).");
   WiFi.mode(WIFI_STA); WiFi.persistent(true);
-  WiFi.setAutoConnect(false); WiFi.setAutoReconnect(false);
+  wifiSetAutoConnect(false); WiFi.setAutoReconnect(false);
   WiFi.disconnect(true, true); WiFi.softAPdisconnect(true); apRunning = false; delay(100);
   wm.setConfigPortalTimeout(300);
   wm.setAPCallback([](WiFiManager *){ showPortalStaticPurple(true); });
@@ -1120,7 +1128,7 @@ static void handleForgetWifi(){
   File f = LittleFS.open(FORGET_FILE, "w"); if (f) { f.println("1"); f.close(); }
   wifiStore.clear();   // networks in secrets.h are still tried
   WiFi.mode(WIFI_STA); WiFi.persistent(true);
-  WiFi.setAutoConnect(false); WiFi.setAutoReconnect(false);
+  wifiSetAutoConnect(false); WiFi.setAutoReconnect(false);
   WiFi.disconnect(true, true);
   delay(100); ESP.restart();
 }
@@ -1284,7 +1292,7 @@ void setup(){
  
   WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
-  WiFi.setAutoConnect(!forgetOnce);
+  wifiSetAutoConnect(!forgetOnce);
   WiFi.setAutoReconnect(!forgetOnce);
   WiFi.setSleep(false);
  
