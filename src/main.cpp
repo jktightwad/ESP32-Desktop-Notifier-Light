@@ -43,11 +43,11 @@
 #define TOUCH_LONG_MS      800        // hold this long = cycle presence
 
 // TDB05LFPN magnetic buzzer (5V / ~30mA) on GPIO7 via NPN transistor (not direct).
-// Driven with a 2300Hz square wave, which sounds whether or not the part has an
-// internal oscillator. If yours is self-drive and sounds rough, set BUZZER_SELF_DRIVE 1.
+// Bench-tested: steady tone on plain 5V DC = built-in oscillator, so drive it on/off.
+// Set BUZZER_SELF_DRIVE 0 to drive a passive buzzer with a BUZZER_FREQ_HZ square wave.
 #define BUZZER_PIN         7
 #define BUZZER_FREQ_HZ     2300
-#define BUZZER_SELF_DRIVE  0
+#define BUZZER_SELF_DRIVE  1
 
 
 // ---------------------- Adafruit IO (AIO) -----------------------------
