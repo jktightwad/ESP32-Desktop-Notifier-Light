@@ -1,10 +1,11 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.8.7-c3
+// Version: 1.8.8-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off; 1/2/3 taps + hold = cycle
-//    fun modes / presence / fast comet colours (1s per step), release keeps
+//    fun modes / presence / fast comet colours, release keeps
+//  - Touch/buzzer timings editable on /advanced (saved to /touch.txt)
 //  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO {"beep":n}
 //  - Keeps: AIO instant re-subscribe, LED Gap, Last AIO msg, OTA, etc.
 // =====================================================================
@@ -31,7 +32,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.8.7-c3"
+#define FIRMWARE_VERSION   "1.8.8-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -41,17 +42,18 @@
 // Module default (jumpers open) = momentary, HIGH while touched.
 #define TOUCH_PIN          10
 #define TOUCH_ACTIVE       HIGH
-#define TOUCH_DEBOUNCE_MS  30         // ignore edges shorter than this
-#define TOUCH_GAP_MS       400        // max gap between taps of one gesture
-#define TOUCH_HOLD_MS      600        // after 1-3 taps, holding this long starts a cycle
-#define TOUCH_STEP_MS      1000       // cycle: time per mode
-#define COMET_FAST_SPEED   85         // UI speed (0-100) for the 3-tap colour comet
+// Defaults for the touch settings (editable on /advanced, saved in /touch.txt)
+#define DEFAULT_TOUCH_DEBOUNCE_MS  30     // ignore edges shorter than this
+#define DEFAULT_TOUCH_GAP_MS       400    // max gap between taps of one gesture
+#define DEFAULT_TOUCH_HOLD_MS      600    // after 1-3 taps, holding this long starts a cycle
+#define DEFAULT_TOUCH_STEP_MS      1000   // cycle: time per mode
+#define DEFAULT_COMET_FAST_SPEED   85     // UI speed (0-100) for the 3-tap colour comet
 
 // TDB05LFPN magnetic buzzer (5V / ~30mA) on GPIO7 via NPN transistor (not direct).
 // Bench-tested: steady tone on plain 5V DC = built-in oscillator, so drive it on/off.
 // Beep timing runs on an esp_timer, so it stays short even if loop() is blocked.
 #define BUZZER_PIN         7
-#define BEEP_TAP_MS        15         // on/off and cycle confirm
+#define DEFAULT_BEEP_MS    15         // on/off and cycle confirm (0 = silent)
 
 
 // ---------------------- Adafruit IO (AIO) -----------------------------
@@ -67,12 +69,21 @@ static const char* GROUPS_FILE     = "/groups.txt";       // AIO group list
 static const char* FORGET_FILE     = "/forget.flag";      // one-shot: force portal next boot
 static const char* OTAONLY_FILE    = "/otaonly.flag";     // recovery flag
 static const char* HW_FILE         = "/hw.txt";           // "pin,count,gap"
+static const char* TOUCH_FILE      = "/touch.txt";        // "debounce,gap,hold,step,comet,beep"
 static const char* LASTMSG_FILE    = "/lastmsg.json";     // persists last AIO message
  
 // ---------------------- Globals --------------------------------------
 static uint16_t gLedCount = DEFAULT_LED_COUNT;
 static uint8_t  gLedPin   = DEFAULT_LED_PIN;
 static uint16_t gLedGap   = DEFAULT_LED_GAP;
+
+// Touch / buzzer settings (ms unless noted)
+static uint16_t gTouchDebounceMs = DEFAULT_TOUCH_DEBOUNCE_MS;
+static uint16_t gTouchGapMs      = DEFAULT_TOUCH_GAP_MS;
+static uint16_t gTouchHoldMs     = DEFAULT_TOUCH_HOLD_MS;
+static uint16_t gTouchStepMs     = DEFAULT_TOUCH_STEP_MS;
+static uint8_t  gCometFastSpeed  = DEFAULT_COMET_FAST_SPEED;   // 0-100
+static uint16_t gBeepMs          = DEFAULT_BEEP_MS;
  
 Adafruit_NeoPixel strip(DEFAULT_LED_COUNT, DEFAULT_LED_PIN, NEO_GRB + NEO_KHZ800);
 WebServer server(80);
@@ -211,6 +222,36 @@ static void loadHardwareCfg(){
   if (pin>=0 && pin<=21) gLedPin = (uint8_t)pin;
   if (cnt>=1 && cnt<=600) gLedCount = (uint16_t)cnt;
   if (gap>=0 && gap<=gLedCount*2) gLedGap = (uint16_t)gap;
+}
+// Touch cfg: "debounce,gap,hold,step,comet,beep". Values are clamped to the UI ranges
+// (as long, before narrowing, so out-of-range input can't wrap).
+static void setTouchCfg(long debounce, long gap, long hold, long step, long comet, long beepMs){
+  gTouchDebounceMs = (uint16_t)constrain(debounce, 5L, 200L);
+  gTouchGapMs      = (uint16_t)constrain(gap, 150L, 1500L);
+  gTouchHoldMs     = (uint16_t)constrain(hold, 200L, 3000L);
+  gTouchStepMs     = (uint16_t)constrain(step, 200L, 5000L);
+  gCometFastSpeed  = (uint8_t) constrain(comet, 0L, 100L);
+  gBeepMs          = (uint16_t)constrain(beepMs, 0L, 500L);
+}
+static void loadTouchCfg(){
+  if (!LittleFS.exists(TOUCH_FILE)) return;
+  File f = LittleFS.open(TOUCH_FILE, "r"); if (!f) return;
+  String line = f.readStringUntil('\n'); f.close(); line.trim();
+  long v[6]; int n = 0, from = 0;
+  while (n < 6){
+    int c = line.indexOf(',', from);
+    v[n++] = line.substring(from, c < 0 ? line.length() : c).toInt();
+    if (c < 0) break;
+    from = c + 1;
+  }
+  if (n != 6) return;   // malformed: keep defaults
+  setTouchCfg(v[0], v[1], v[2], v[3], v[4], v[5]);
+}
+static void saveTouchCfg(){
+  File f = LittleFS.open(TOUCH_FILE, "w"); if (!f) return;
+  f.printf("%u,%u,%u,%u,%u,%u\n", (unsigned)gTouchDebounceMs, (unsigned)gTouchGapMs, (unsigned)gTouchHoldMs,
+           (unsigned)gTouchStepMs, (unsigned)gCometFastSpeed, (unsigned)gBeepMs);
+  f.close();
 }
 static void saveHardwareCfg(){
   File f = LittleFS.open(HW_FILE, "w"); if (!f) return;
@@ -1032,6 +1073,31 @@ static void handleAdvanced(){
         "<button class='btn' type='submit'>Save & Reboot</button></form>"
         "<p style='color:#bbb;margin:8px 0 0 0'>Gap makes circular effects move smoothly over the physical gap.</p>"));
   cardEnd();
+
+  // Touch / buzzer timing
+  cardStart(F("Touch &amp; Buzzer"));
+  out(F("<form action='/save_touch' method='get' class='row' style='margin:0'>"
+        "<div>Debounce ms</div><input type='number' name='debounce' min='5' max='200' value='"));
+  out(String(gTouchDebounceMs));
+  out(F("'><div>Tap gap ms</div><input type='number' name='gap' min='150' max='1500' value='"));
+  out(String(gTouchGapMs));
+  out(F("'><div>Hold ms</div><input type='number' name='hold' min='200' max='3000' value='"));
+  out(String(gTouchHoldMs));
+  out(F("'><div>Step ms</div><input type='number' name='step' min='200' max='5000' value='"));
+  out(String(gTouchStepMs));
+  out(F("'><div>Comet speed</div><input type='number' name='comet' min='0' max='100' value='"));
+  out(String(gCometFastSpeed));
+  out(F("'><div>Beep ms</div><input type='number' name='beep' min='0' max='500' value='"));
+  out(String(gBeepMs));
+  out(F("'>"
+        "<button class='btn' type='submit'>Save</button></form>"
+        "<a class='btn sm' href='/save_touch?defaults=1'>Defaults</a>"
+        "<p style='color:#bbb;margin:8px 0 0 0'>"
+        "Tap = on/off. 1, 2 or 3 taps then hold = cycle fun modes / presence / fast comet colours.<br>"
+        "Tap gap: max pause between taps. Hold: press length that starts a cycle. "
+        "Step: time per mode while holding. Comet speed: 0-100. Beep 0 = silent. "
+        "Applies immediately, no reboot.</p>"));
+  cardEnd();
  
   // Last AIO Message
   cardStart(F("Last AIO Message"));
@@ -1166,6 +1232,22 @@ static void handleOtaRecovery(){
   server.send(200,"text/plain","Entering OTA Recovery… rebooting");
   delay(300); ESP.restart();
 }
+static void handleSaveTouch(){
+  if (server.hasArg("defaults")){
+    setTouchCfg(DEFAULT_TOUCH_DEBOUNCE_MS, DEFAULT_TOUCH_GAP_MS, DEFAULT_TOUCH_HOLD_MS,
+                DEFAULT_TOUCH_STEP_MS, DEFAULT_COMET_FAST_SPEED, DEFAULT_BEEP_MS);
+  } else {
+    // Missing fields keep their current value.
+    auto arg = [](const char* k, long cur){ return server.hasArg(k) ? server.arg(k).toInt() : cur; };
+    setTouchCfg(arg("debounce", gTouchDebounceMs), arg("gap", gTouchGapMs), arg("hold", gTouchHoldMs),
+                arg("step", gTouchStepMs), arg("comet", gCometFastSpeed), arg("beep", gBeepMs));
+  }
+  saveTouchCfg();
+  Serial.printf("[TOUCH] cfg debounce=%u gap=%u hold=%u step=%u comet=%u beep=%u\n",
+    (unsigned)gTouchDebounceMs, (unsigned)gTouchGapMs, (unsigned)gTouchHoldMs,
+    (unsigned)gTouchStepMs, (unsigned)gCometFastSpeed, (unsigned)gBeepMs);
+  server.sendHeader("Location","/advanced"); server.send(302);
+}
 static void handleSaveHardware(){
   int pin   = server.hasArg("pin")   ? server.arg("pin").toInt()   : DEFAULT_LED_PIN;
   int count = server.hasArg("count") ? server.arg("count").toInt() : DEFAULT_LED_COUNT;
@@ -1214,12 +1296,12 @@ static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
 }
 
 // ---------------------- Touch (HW-139) -------------------------------
-// Gestures (a tap is any press+release; taps within TOUCH_GAP_MS chain together):
+// Gestures (a tap is any press+release; taps within gTouchGapMs chain together):
 //   tap (any length, nothing after)  -> on/off; on = last mode used, or Party if none yet
 //   1 tap, then hold                 -> cycle fun modes
 //   2 taps, then hold                -> cycle presence: Available / Busy / Away
 //   3 taps, then hold                -> fast comet cycling R/G/B/Y/C/M/White
-// While holding, the light switches to the next item every TOUCH_STEP_MS;
+// While holding, the light switches to the next item every gTouchStepMs;
 // releasing keeps the one showing (confirm beep). Other tap counts are ignored.
 enum TouchCycle : uint8_t { TC_NONE, TC_FUN, TC_PRESENCE, TC_COMET };
 
@@ -1239,13 +1321,14 @@ static TouchCycle touchCycle    = TC_NONE;
 static int        cycleIdx      = 0;
 static uint32_t   cycleNextMs   = 0;
 static bool          cometFast  = false;   // effectDelay currently overridden by the 3-tap comet
-static unsigned long savedDelay = 0;
+static unsigned long savedDelay = 0, cometDelay = 0;
 
 static void restoreSpeed(){
   // Undo the fast-comet speed unless something else (web/AIO) changed it since.
-  if (cometFast && effectDelay == speedToDelay(COMET_FAST_SPEED)) effectDelay = savedDelay;
+  if (cometFast && effectDelay == cometDelay) effectDelay = savedDelay;
   cometFast = false;
 }
+static void touchBeep(){ if (gBeepMs) beep(1, gBeepMs); }
 static void touchToggle(){
   stopDiscoveryBlink(true);
   if (powerState && currentEffect!=OFF){
@@ -1257,7 +1340,7 @@ static void touchToggle(){
     powerState = true;
     setAllPixels(currentEffect==SOLID ? currentColor : 0);
   }
-  beep(1, BEEP_TAP_MS);
+  touchBeep();
   Serial.printf("[TOUCH] tap -> %s\n", getEffectName().c_str());
 }
 static int cycleLen(TouchCycle c){
@@ -1283,7 +1366,7 @@ static void cycleApply(TouchCycle c, int i){
     applyPresence(PRESENCE[i]);
   } else if (c==TC_COMET){
     if (!cometFast){ savedDelay = effectDelay; cometFast = true; }
-    effectDelay = speedToDelay(COMET_FAST_SPEED);
+    effectDelay = cometDelay = speedToDelay(gCometFastSpeed);
     const uint32_t col = COMET_COLORS[i];
     applyColorPreserveBrightness((col>>16)&0xFF, (col>>8)&0xFF, col&0xFF);
     if (currentEffect!=COMET || !powerState) setAllPixels(0);
@@ -1295,15 +1378,15 @@ static void serviceTouch(){
   // Remember the last "on" mode from any source (web, AIO, touch) for tap-to-restore.
   if (powerState && currentEffect!=OFF) lastOnEffect = currentEffect;
 
-  // Debounce: accept a new level only after it has been stable for TOUCH_DEBOUNCE_MS.
+  // Debounce: accept a new level only after it has been stable for gTouchDebounceMs.
   const bool raw = (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE);
   if (raw != touchRaw){ touchRaw = raw; touchRawMs = now; }
-  if (raw != touchStable && (now - touchRawMs) >= TOUCH_DEBOUNCE_MS){
+  if (raw != touchStable && (now - touchRawMs) >= gTouchDebounceMs){
     touchStable = raw;
     if (touchStable){
       touchDownMs = now;
     } else if (touchCycle != TC_NONE){            // release ends a cycle: keep it
-      beep(1, BEEP_TAP_MS);
+      touchBeep();
       Serial.printf("[TOUCH] cycle %d -> item %d (%s)\n", (int)touchCycle, cycleIdx, getEffectName().c_str());
       touchCycle = TC_NONE; tapCount = 0;
     } else {
@@ -1314,17 +1397,17 @@ static void serviceTouch(){
 
   if (touchStable){
     const uint32_t held = now - touchDownMs;
-    if (touchCycle == TC_NONE && tapCount >= 1 && tapCount <= 3 && held >= TOUCH_HOLD_MS){
+    if (touchCycle == TC_NONE && tapCount >= 1 && tapCount <= 3 && held >= gTouchHoldMs){
       touchCycle = (TouchCycle)tapCount;           // 1 = fun, 2 = presence, 3 = comet
       cycleIdx = 0;
       cycleApply(touchCycle, cycleIdx);
-      cycleNextMs = now + TOUCH_STEP_MS;
+      cycleNextMs = now + gTouchStepMs;
     } else if (touchCycle != TC_NONE && (long)(now - cycleNextMs) >= 0){
       cycleIdx = (cycleIdx + 1) % cycleLen(touchCycle);
       cycleApply(touchCycle, cycleIdx);
-      cycleNextMs += TOUCH_STEP_MS;
+      cycleNextMs += gTouchStepMs;
     }
-  } else if (tapCount && (now - touchUpMs) >= TOUCH_GAP_MS){
+  } else if (tapCount && (now - touchUpMs) >= gTouchGapMs){
     if (tapCount == 1) touchToggle();
     else Serial.printf("[TOUCH] %u taps without hold - ignored\n", (unsigned)tapCount);
     tapCount = 0;
@@ -1344,6 +1427,7 @@ void setup(){
     loadAIODevice();
     loadGroups();
     loadHardwareCfg();
+    loadTouchCfg();
     loadLastMsg();
     wifiStore.load();
   } else {
@@ -1397,6 +1481,7 @@ void setup(){
   server.on("/groups/del", handleGroupsDel);
   server.on("/otarecovery", handleOtaRecovery);
   server.on("/save_hw", handleSaveHardware);
+  server.on("/save_touch", handleSaveTouch);
  
   // health + captive probes
   server.on("/health", [](){ server.send(200,"text/plain","OK"); });
