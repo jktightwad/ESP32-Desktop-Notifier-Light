@@ -1,10 +1,10 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.8.6-c3
+// Version: 1.8.7-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
-//  - HW-139 touch on GPIO10: tap = on/off (last mode / Party),
-//    hold = preview statuses every 350ms, release applies
+//  - HW-139 touch on GPIO10: tap = on/off; 1/2/3 taps + hold = cycle
+//    fun modes / presence / fast comet colours (1s per step), release keeps
 //  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO {"beep":n}
 //  - Keeps: AIO instant re-subscribe, LED Gap, Last AIO msg, OTA, etc.
 // =====================================================================
@@ -31,7 +31,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.8.6-c3"
+#define FIRMWARE_VERSION   "1.8.7-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -41,15 +41,17 @@
 // Module default (jumpers open) = momentary, HIGH while touched.
 #define TOUCH_PIN          10
 #define TOUCH_ACTIVE       HIGH
-#define TOUCH_DEBOUNCE_MS  30
-#define TOUCH_STEP_MS      350        // hold: each step previews the next status
+#define TOUCH_DEBOUNCE_MS  30         // ignore edges shorter than this
+#define TOUCH_GAP_MS       400        // max gap between taps of one gesture
+#define TOUCH_HOLD_MS      600        // after 1-3 taps, holding this long starts a cycle
+#define TOUCH_STEP_MS      1000       // cycle: time per mode
+#define COMET_FAST_SPEED   85         // UI speed (0-100) for the 3-tap colour comet
 
 // TDB05LFPN magnetic buzzer (5V / ~30mA) on GPIO7 via NPN transistor (not direct).
 // Bench-tested: steady tone on plain 5V DC = built-in oscillator, so drive it on/off.
 // Beep timing runs on an esp_timer, so it stays short even if loop() is blocked.
 #define BUZZER_PIN         7
-#define BEEP_TAP_MS        15         // tap / confirm
-#define BEEP_TICK_MS       8          // each status step while holding
+#define BEEP_TAP_MS        15         // on/off and cycle confirm
 
 
 // ---------------------- Adafruit IO (AIO) -----------------------------
@@ -1212,21 +1214,39 @@ static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
 }
 
 // ---------------------- Touch (HW-139) -------------------------------
-// Tap (< TOUCH_STEP_MS): on -> off; off -> last mode used, or Party if none yet.
-// Hold: every TOUCH_STEP_MS the light previews the next status
-// (Available -> Busy -> Away -> ...); releasing applies the one showing.
-static const char* const TOUCH_STATUS[]   = { "available", "busy", "away" };
-static const uint32_t    TOUCH_STATUS_RGB[] = { 0x00FF00, 0xFF0000, 0x0000FF };
-static const int         TOUCH_STATUS_N   = 3;
+// Gestures (a tap is any press+release; taps within TOUCH_GAP_MS chain together):
+//   tap (any length, nothing after)  -> on/off; on = last mode used, or Party if none yet
+//   1 tap, then hold                 -> cycle fun modes
+//   2 taps, then hold                -> cycle presence: Available / Busy / Away
+//   3 taps, then hold                -> fast comet cycling R/G/B/Y/C/M/White
+// While holding, the light switches to the next item every TOUCH_STEP_MS;
+// releasing keeps the one showing (confirm beep). Other tap counts are ignored.
+enum TouchCycle : uint8_t { TC_NONE, TC_FUN, TC_PRESENCE, TC_COMET };
 
-static effect   lastOnEffect   = OFF;     // OFF = no mode used yet since boot
-static bool     touchStable    = false;   // debounced state
-static bool     touchRaw       = false;
-static uint32_t touchRawMs     = 0;
-static uint32_t touchDownMs    = 0;
-static int      touchPreview   = -1;      // index into TOUCH_STATUS, -1 = not previewing
+static const effect      FUN_EFFECTS[]  = { SOLID, BLINK, PARTY, KNIGHT_RIDER, BREATHE, COMET, RAINBOW, PULSE };
+static const char* const PRESENCE[]     = { "available", "busy", "away" };
+static const uint32_t    COMET_COLORS[] = { 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF };
+#define ARRAY_LEN(a) (int)(sizeof(a)/sizeof((a)[0]))
 
-static void touchTap(){
+static effect     lastOnEffect  = OFF;     // OFF = no mode used yet since boot
+static bool       touchStable   = false;   // debounced state
+static bool       touchRaw      = false;
+static uint32_t   touchRawMs    = 0;
+static uint32_t   touchDownMs   = 0;
+static uint32_t   touchUpMs     = 0;
+static uint8_t    tapCount      = 0;       // completed taps in the current gesture
+static TouchCycle touchCycle    = TC_NONE;
+static int        cycleIdx      = 0;
+static uint32_t   cycleNextMs   = 0;
+static bool          cometFast  = false;   // effectDelay currently overridden by the 3-tap comet
+static unsigned long savedDelay = 0;
+
+static void restoreSpeed(){
+  // Undo the fast-comet speed unless something else (web/AIO) changed it since.
+  if (cometFast && effectDelay == speedToDelay(COMET_FAST_SPEED)) effectDelay = savedDelay;
+  cometFast = false;
+}
+static void touchToggle(){
   stopDiscoveryBlink(true);
   if (powerState && currentEffect!=OFF){
     currentEffect = OFF; powerState = false; setAllPixels(0);
@@ -1235,42 +1255,79 @@ static void touchTap(){
     effectPosition = 0; effectDirection = 1;
     if (currentEffect==PULSE) pulseResetRequested = true;
     powerState = true;
-    if (currentEffect==SOLID) setAllPixels(currentColor);
+    setAllPixels(currentEffect==SOLID ? currentColor : 0);
   }
   beep(1, BEEP_TAP_MS);
   Serial.printf("[TOUCH] tap -> %s\n", getEffectName().c_str());
+}
+static int cycleLen(TouchCycle c){
+  switch (c){
+    case TC_FUN:      return ARRAY_LEN(FUN_EFFECTS);
+    case TC_PRESENCE: return ARRAY_LEN(PRESENCE);
+    case TC_COMET:    return ARRAY_LEN(COMET_COLORS);
+    default:          return 1;
+  }
+}
+// Applies item i of the cycle live, so the light shows exactly what release will keep.
+static void cycleApply(TouchCycle c, int i){
+  stopDiscoveryBlink(true);
+  if (c==TC_FUN){
+    restoreSpeed();
+    currentEffect = FUN_EFFECTS[i];
+    effectPosition = 0; effectDirection = 1;
+    if (currentEffect==PULSE) pulseResetRequested = true;
+    powerState = true;
+    setAllPixels(currentEffect==SOLID ? currentColor : 0);
+  } else if (c==TC_PRESENCE){
+    restoreSpeed();
+    applyPresence(PRESENCE[i]);
+  } else if (c==TC_COMET){
+    if (!cometFast){ savedDelay = effectDelay; cometFast = true; }
+    effectDelay = speedToDelay(COMET_FAST_SPEED);
+    const uint32_t col = COMET_COLORS[i];
+    applyColorPreserveBrightness((col>>16)&0xFF, (col>>8)&0xFF, col&0xFF);
+    if (currentEffect!=COMET || !powerState) setAllPixels(0);
+    currentEffect = COMET; powerState = true;
+  }
 }
 static void serviceTouch(){
   const uint32_t now = millis();
   // Remember the last "on" mode from any source (web, AIO, touch) for tap-to-restore.
   if (powerState && currentEffect!=OFF) lastOnEffect = currentEffect;
 
+  // Debounce: accept a new level only after it has been stable for TOUCH_DEBOUNCE_MS.
   const bool raw = (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE);
   if (raw != touchRaw){ touchRaw = raw; touchRawMs = now; }
   if (raw != touchStable && (now - touchRawMs) >= TOUCH_DEBOUNCE_MS){
     touchStable = raw;
-    if (touchStable){ touchDownMs = now; touchPreview = -1; }
-    else if (touchPreview < 0) touchTap();
-    else {
-      const char* st = TOUCH_STATUS[touchPreview];
-      touchPreview = -1;
-      applyPresence(st);
+    if (touchStable){
+      touchDownMs = now;
+    } else if (touchCycle != TC_NONE){            // release ends a cycle: keep it
       beep(1, BEEP_TAP_MS);
-      Serial.printf("[TOUCH] hold -> %s\n", st);
+      Serial.printf("[TOUCH] cycle %d -> item %d (%s)\n", (int)touchCycle, cycleIdx, getEffectName().c_str());
+      touchCycle = TC_NONE; tapCount = 0;
+    } else {
+      if (tapCount < 255) ++tapCount;
+      touchUpMs = now;
     }
   }
+
   if (touchStable){
     const uint32_t held = now - touchDownMs;
-    if (held >= TOUCH_STEP_MS){
-      const int idx = (int)((held / TOUCH_STEP_MS - 1) % TOUCH_STATUS_N);
-      if (idx != touchPreview){
-        if (touchPreview < 0) stopDiscoveryBlink(true);
-        touchPreview = idx;
-        const uint32_t c = TOUCH_STATUS_RGB[idx];
-        setAllPixels(RGB((c>>16)&0xFF, (c>>8)&0xFF, c&0xFF));
-        beep(1, BEEP_TICK_MS);
-      }
+    if (touchCycle == TC_NONE && tapCount >= 1 && tapCount <= 3 && held >= TOUCH_HOLD_MS){
+      touchCycle = (TouchCycle)tapCount;           // 1 = fun, 2 = presence, 3 = comet
+      cycleIdx = 0;
+      cycleApply(touchCycle, cycleIdx);
+      cycleNextMs = now + TOUCH_STEP_MS;
+    } else if (touchCycle != TC_NONE && (long)(now - cycleNextMs) >= 0){
+      cycleIdx = (cycleIdx + 1) % cycleLen(touchCycle);
+      cycleApply(touchCycle, cycleIdx);
+      cycleNextMs += TOUCH_STEP_MS;
     }
+  } else if (tapCount && (now - touchUpMs) >= TOUCH_GAP_MS){
+    if (tapCount == 1) touchToggle();
+    else Serial.printf("[TOUCH] %u taps without hold - ignored\n", (unsigned)tapCount);
+    tapCount = 0;
   }
 }
 
@@ -1368,7 +1425,7 @@ void loop(){
   ArduinoOTA.handle();
   serviceTouch();
  
-  if (!statusActive && touchPreview < 0){
+  if (!statusActive){
     switch (currentEffect){
       case BLINK:        handleBlink(); break;
       case PARTY:        handleParty(); break;
