@@ -1,13 +1,14 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.9.0-c3
+// Version: 1.9.1-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off; 1/2/3 taps + hold = cycle
 //    fun modes / presence / fast comet colours, release keeps
 //  - Touch/buzzer timings editable on /advanced (saved to /touch.txt)
 //  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO "beep" (count, {count,on,off}, or [ms,...])
-//  - AIO "poll": devices reply "onair-pong" on the devices feed (find offline units)
+//  - AIO "poll": devices post "onair-pong" to group "checkin"; devices in that
+//    group list who replied (and who didn't) on their main page
 //  - Keeps: AIO instant re-subscribe, LED Gap, Last AIO msg, OTA, etc.
 // =====================================================================
 
@@ -33,7 +34,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.9.0-c3"
+#define FIRMWARE_VERSION   "1.9.1-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -74,6 +75,7 @@ static const char* OTAONLY_FILE    = "/otaonly.flag";     // recovery flag
 static const char* HW_FILE         = "/hw.txt";           // "pin,count,gap"
 static const char* TOUCH_FILE      = "/touch.txt";        // "debounce,gap,hold,step,comet,beep"
 static const char* LASTMSG_FILE    = "/lastmsg.json";     // persists last AIO message
+static const char* ROSTER_FILE     = "/roster.json";      // check-in roster (known devices)
  
 // ---------------------- Globals --------------------------------------
 static uint16_t gLedCount = DEFAULT_LED_COUNT;
@@ -136,13 +138,27 @@ static bool discoveryBlinkActive = false;
 static void beep(uint8_t count=1, uint16_t onMs=60, uint16_t offMs=80);   // buzzer, defined below
 static void beepPattern(const uint16_t* ms, uint8_t n);
 
-// Poll / pong: {"group":"all","poll":"abc"} -> each targeted device replies on
-// the devices feed after a random delay (spreads replies under AIO rate limits).
+// Poll / pong: {"group":"all","poll":"abc"} -> each targeted device posts an
+// "onair-pong" to the "checkin" group on the control feed after a random delay
+// (spreads replies under AIO rate limits). Devices in the "checkin" group keep
+// a roster of those replies and show it on their main page.
 #define POLL_WINDOW_DEFAULT_S 10
 #define POLL_WINDOW_MAX_S     120
+#define CHECKIN_GROUP         "checkin"
+#define ROSTER_MAX            40
 static bool     pongPending = false;
 static uint32_t pongAtMs    = 0;
 static String   pongId;
+
+struct RosterEntry {
+  String mac, name, id, ip, fw, mode, poll;
+  int rssi = 0; uint32_t uptime = 0, seenMs = 0;
+  bool seen = false;            // false = known from flash, not heard since boot
+};
+static std::vector<RosterEntry> roster;
+static String   lastPollId;     // latest poll seen on the feed (any target)
+static uint32_t lastPollMs = 0;
+static int      lastPollWindowS = 0;
  
 // ---------------------- Helpers --------------------------------------
 static inline uint32_t RGB(uint8_t r,uint8_t g,uint8_t b){ return strip.Color(r,g,b); }
@@ -745,19 +761,98 @@ static void recordLastMsg(const String& topic, const String& payload){
   lastMsgTopic = topic; lastMsgPayload = payload; lastMsgMs = millis();
   saveLastMsg();
 }
+// ---------------------- Check-in roster -------------------------------
+static bool inCheckinGroup(){
+  for (auto &g : groups) if (eqId(g, CHECKIN_GROUP)) return true;
+  return false;
+}
+// Only identity fields are saved (written when a device is new or they change).
+static void saveRoster(){
+  File f = LittleFS.open(ROSTER_FILE, "w"); if (!f) return;
+  JsonDocument d; JsonArray a = d.to<JsonArray>();
+  for (auto &e : roster){
+    JsonObject o = a.add<JsonObject>();
+    o["mac"]=e.mac; o["name"]=e.name; o["id"]=e.id; o["ip"]=e.ip; o["fw"]=e.fw;
+  }
+  serializeJson(d, f); f.close();
+}
+static void loadRoster(){
+  roster.clear();
+  if (!LittleFS.exists(ROSTER_FILE)) return;
+  File f = LittleFS.open(ROSTER_FILE, "r"); if (!f) return;
+  JsonDocument d; DeserializationError e = deserializeJson(d, f); f.close();
+  if (e || !d.is<JsonArray>()) return;
+  for (JsonObject o : d.as<JsonArray>()){
+    if (roster.size() >= ROSTER_MAX) break;
+    RosterEntry r;
+    r.mac = o["mac"] | ""; r.name = o["name"] | ""; r.id = o["id"] | "";
+    r.ip  = o["ip"]  | ""; r.fw   = o["fw"]   | "";
+    if (r.mac.length()) roster.push_back(r);
+  }
+}
+static void clearRoster(){ roster.clear(); LittleFS.remove(ROSTER_FILE); }
+static void rosterUpdate(JsonObjectConst dev, const String& poll){
+  String mac = dev["mac"] | "";
+  if (!mac.length()) return;
+  RosterEntry* e = nullptr;
+  for (auto &r : roster) if (r.mac == mac){ e = &r; break; }
+  bool changed = false;
+  if (!e){
+    if (roster.size() >= ROSTER_MAX) return;
+    roster.push_back(RosterEntry()); e = &roster.back(); e->mac = mac; changed = true;
+  }
+  String name = dev["name"] | "", id = dev["id"] | "", ip = dev["ip"] | "", fw = dev["fw"] | "";
+  if (e->name!=name || e->id!=id || e->ip!=ip || e->fw!=fw) changed = true;
+  e->name = name; e->id = id; e->ip = ip; e->fw = fw;
+  e->mode   = dev["mode"] | "";
+  e->rssi   = dev["rssi"] | 0;
+  e->uptime = dev["uptime"] | 0;
+  e->poll   = poll;
+  e->seenMs = millis(); e->seen = true;
+  if (changed) saveRoster();
+}
+static void fillDeviceInfo(JsonObject dev){
+  dev["name"]   = deviceName;
+  dev["id"]     = aioDeviceId;
+  dev["ip"]     = WiFi.localIP().toString();
+  dev["mac"]    = macString();
+  dev["fw"]     = FIRMWARE_VERSION;
+  dev["uptime"] = millis() / 1000UL;
+  dev["rssi"]   = WiFi.RSSI();
+  dev["mode"]   = powerState ? getEffectName() : String("Off");
+  JsonArray g = dev["groups"].to<JsonArray>();
+  for (auto &x : groups) g.add(x);
+}
+
 static void applyCommand(const JsonObject& obj, const String& srcTopic, const String& rawPayload){
-  if (!isTargeted(obj)) return;
+  // Check-in replies from other devices: only the "checkin" group keeps them.
+  const char* type = obj["type"] | "";
+  if (!strcmp(type, "onair-pong")){
+    if (inCheckinGroup() && obj["dev"].is<JsonObjectConst>())
+      rosterUpdate(obj["dev"].as<JsonObjectConst>(), String(obj["poll"] | ""));
+    return;
+  }
 
   // "poll": "<id>" | true | {"id":"<id>","window":<seconds>}
-  if (!obj["poll"].isNull()){
-    int window = POLL_WINDOW_DEFAULT_S;
-    pongId = "";
-    if (obj["poll"].is<const char*>()) pongId = obj["poll"].as<const char*>();
+  // Noted before targeting so the check-in page knows a poll is in progress.
+  int pollWindow = POLL_WINDOW_DEFAULT_S;
+  String pollId;
+  const bool isPoll = !obj["poll"].isNull();
+  if (isPoll){
+    if (obj["poll"].is<const char*>()) pollId = obj["poll"].as<const char*>();
     else if (obj["poll"].is<JsonObjectConst>()){
       JsonObjectConst pl = obj["poll"].as<JsonObjectConst>();
-      if (pl["id"].is<const char*>()) pongId = pl["id"].as<const char*>();
-      if (pl["window"].is<int>())     window = constrain((int)pl["window"], 0, POLL_WINDOW_MAX_S);
+      if (pl["id"].is<const char*>()) pollId = pl["id"].as<const char*>();
+      if (pl["window"].is<int>())     pollWindow = constrain((int)pl["window"], 0, POLL_WINDOW_MAX_S);
     }
+    lastPollId = pollId; lastPollMs = millis(); lastPollWindowS = pollWindow;
+  }
+
+  if (!isTargeted(obj)) return;
+
+  if (isPoll){
+    pongId = pollId;
+    const int window = pollWindow;
     pongAtMs = millis() + (window ? (uint32_t)random(0, window * 1000L) : 0);
     pongPending = true;
     Serial.printf("[AIO] Poll \"%s\": reply in %lums\n", pongId.c_str(), (unsigned long)(pongAtMs - millis()));
@@ -885,24 +980,33 @@ static void announceDevice(){
   Serial.printf("[AIO] Announce %s: %s\n", ok ? "sent" : "FAILED", out.c_str());
 }
  
+// Device details are nested under "dev" so they can't be read as targeting
+// fields (deviceId / groups) by the devices that receive the pong.
 static void sendPong(){
   JsonDocument d;
-  d["type"]     = "onair-pong";
-  d["poll"]     = pongId;
-  d["name"]     = deviceName;
-  d["deviceId"] = aioDeviceId;
-  d["ip"]       = WiFi.localIP().toString();
-  d["mac"]      = macString();
-  d["fw"]       = FIRMWARE_VERSION;
-  d["uptime"]   = millis() / 1000UL;
-  d["rssi"]     = WiFi.RSSI();
-  d["mode"]     = powerState ? getEffectName() : String("Off");
-  JsonArray g = d["groups"].to<JsonArray>();
-  for (auto &x : groups) g.add(x);
+  d["type"]  = "onair-pong";
+  d["group"] = CHECKIN_GROUP;
+  d["poll"]  = pongId;
+  fillDeviceInfo(d["dev"].to<JsonObject>());
   String out; serializeJson(d, out);
-  String topic = aioTopic(AIO_FEED_DEVICES);
+  String topic = aioTopic(AIO_FEED_CONTROL);
   bool ok = mqtt.publish(topic.c_str(), out.c_str());
   Serial.printf("[AIO] Pong %s: %s\n", ok ? "sent" : "FAILED", out.c_str());
+  // List ourselves too, in case the broker doesn't echo our own publish back.
+  if (ok && inCheckinGroup()) rosterUpdate(d["dev"].as<JsonObjectConst>(), pongId);
+}
+// Sends a poll to every device (from the check-in page button).
+static bool sendPoll(int windowS){
+  if (!mqtt.connected()) return false;
+  JsonDocument d;
+  d["group"] = "all";
+  String id = String("w") + String(millis() / 1000UL);
+  JsonObject pl = d["poll"].to<JsonObject>();
+  pl["id"] = id; pl["window"] = windowS;
+  String out; serializeJson(d, out);
+  bool ok = mqtt.publish(aioTopic(AIO_FEED_CONTROL).c_str(), out.c_str());
+  Serial.printf("[AIO] Poll %s: %s\n", ok ? "sent" : "FAILED", out.c_str());
+  return ok;
 }
 static void servicePong(){
   if (!pongPending || (long)(millis() - pongAtMs) < 0 || !mqtt.connected()) return;
@@ -1044,6 +1148,64 @@ static void cardStart(const __FlashStringHelper* t){ server.sendContent(F("<div 
 static void cardEnd(){ server.sendContent(F("</div>")); }
  
 // ---------------------- Pages -----------------------------------------
+static String htmlEsc(const String& in){
+  String o; o.reserve(in.length());
+  for (char c : in){
+    if (c=='<') o += "&lt;"; else if (c=='>') o += "&gt;"; else if (c=='&') o += "&amp;";
+    else if (c=='\'') o += "&#39;"; else if (c=='"') o += "&quot;"; else o += c;
+  }
+  return o;
+}
+static String agoStr(uint32_t ms){
+  uint32_t s = ms / 1000UL;
+  if (s < 60)   return String(s) + "s";
+  if (s < 3600) return String(s/60) + "m";
+  return String(s/3600) + "h" + String((s%3600)/60) + "m";
+}
+// "Check-ins" card: devices that answered polls, and who missed the latest one.
+template<typename Out> static void renderCheckins(Out& out){
+  cardStart(F("Check-ins"));
+  out(F("<div class='row'><a class='btn sm' href='/poll'>Poll all devices</a>"
+        "<a class='btn sm' href='/'>Refresh</a>"
+        "<a class='btn sm off' href='/roster/clear'>Clear list</a></div>"));
+  const bool pollRunning = lastPollMs && (millis() - lastPollMs) < (uint32_t)(lastPollWindowS + 5) * 1000UL;
+  if (lastPollMs){
+    out(F("<p style='color:#bbb;margin:6px 0'>Last poll: "));
+    out(agoStr(millis() - lastPollMs)); out(F(" ago"));
+    if (pollRunning) out(F(" &mdash; replies still arriving, refresh shortly"));
+    out(F("</p>"));
+  }
+  if (roster.empty()){
+    out(F("<em>No check-ins yet. Press Poll.</em>"));
+    cardEnd(); return;
+  }
+  std::vector<size_t> idx(roster.size());
+  for (size_t i=0;i<idx.size();++i) idx[i]=i;
+  std::sort(idx.begin(), idx.end(), [](size_t a, size_t b){ return roster[a].name < roster[b].name; });
+  out(F("<div style='overflow-x:auto'><table style='width:100%;border-collapse:collapse;font-size:14px'>"
+        "<tr style='text-align:left;border-bottom:1px solid #666'><th>Name</th><th>Status</th>"
+        "<th>Mode</th><th>FW</th><th>RSSI</th><th>Seen</th></tr>"));
+  for (size_t i : idx){
+    const RosterEntry& e = roster[i];
+    String status, color;
+    if (!lastPollMs)                          { status = "&mdash;";         color = "#bbb"; }
+    else if (e.seen && e.poll == lastPollId)  { status = "online";          color = "#28a745"; }
+    else if (pollRunning)                     { status = "waiting&hellip;"; color = "#bbb"; }
+    else                                      { status = "NO REPLY";        color = "#F44336"; }
+    out(F("<tr style='border-bottom:1px solid #555'><td>"));
+    if (e.ip.length()){ out(F("<a style='color:#8cf' href='http://")); out(htmlEsc(e.ip)); out(F("/'>")); }
+    out(htmlEsc(e.name.length() ? e.name : e.mac));
+    if (e.ip.length()) out(F("</a>"));
+    out(F("</td><td style='color:")); out(color); out(F("'><b>")); out(status);
+    out(F("</b></td><td>")); out(e.seen ? htmlEsc(e.mode) : String("&mdash;"));
+    out(F("</td><td>")); out(htmlEsc(e.fw));
+    out(F("</td><td>")); out(e.seen ? String(e.rssi) : String("&mdash;"));
+    out(F("</td><td>")); out(e.seen ? agoStr(millis() - e.seenMs) + " ago" : String("before reboot"));
+    out(F("</td></tr>"));
+  }
+  out(F("</table></div>"));
+  cardEnd();
+}
 static void handleRoot(){
   if (discoveryBlinkActive) stopDiscoveryBlink(true);
   Serial.println("[HTTP] GET /");
@@ -1119,6 +1281,8 @@ static void handleRoot(){
     }
   }
   cardEnd();
+
+  if (inCheckinGroup()) renderCheckins(out);
  
   endStreamPage();
 }
@@ -1304,6 +1468,14 @@ static void handleOtaRecovery(){
   if (f) { f.println("1"); f.close(); }
   server.send(200,"text/plain","Entering OTA Recovery… rebooting");
   delay(300); ESP.restart();
+}
+static void handlePollNow(){
+  if (!sendPoll(POLL_WINDOW_DEFAULT_S)){ server.send(503,"text/plain","Adafruit IO not connected."); return; }
+  server.sendHeader("Location","/"); server.send(302);
+}
+static void handleRosterClear(){
+  clearRoster();
+  server.sendHeader("Location","/"); server.send(302);
 }
 static void handleSaveTouch(){
   if (server.hasArg("defaults")){
@@ -1508,6 +1680,7 @@ void setup(){
     loadGroups();
     loadHardwareCfg();
     loadTouchCfg();
+    loadRoster();
     loadLastMsg();
     wifiStore.load();
   } else {
@@ -1562,6 +1735,8 @@ void setup(){
   server.on("/otarecovery", handleOtaRecovery);
   server.on("/save_hw", handleSaveHardware);
   server.on("/save_touch", handleSaveTouch);
+  server.on("/poll", handlePollNow);
+  server.on("/roster/clear", handleRosterClear);
  
   // health + captive probes
   server.on("/health", [](){ server.send(200,"text/plain","OK"); });
