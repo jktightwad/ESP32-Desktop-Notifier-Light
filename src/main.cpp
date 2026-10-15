@@ -1,9 +1,10 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.8.5-c3
+// Version: 1.8.6-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
-//  - HW-139 touch on GPIO10: tap = on/off, hold = cycle presence
+//  - HW-139 touch on GPIO10: tap = on/off (last mode / Party),
+//    hold = preview statuses every 350ms, release applies
 //  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO {"beep":n}
 //  - Keeps: AIO instant re-subscribe, LED Gap, Last AIO msg, OTA, etc.
 // =====================================================================
@@ -25,11 +26,12 @@
 #include <math.h>
 #include <algorithm>
 #include <esp_wifi.h>
+#include <esp_timer.h>
 #include <secrets.h>
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.8.5-c3"
+#define FIRMWARE_VERSION   "1.8.6-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -40,14 +42,14 @@
 #define TOUCH_PIN          10
 #define TOUCH_ACTIVE       HIGH
 #define TOUCH_DEBOUNCE_MS  30
-#define TOUCH_LONG_MS      800        // hold this long = cycle presence
+#define TOUCH_STEP_MS      350        // hold: each step previews the next status
 
 // TDB05LFPN magnetic buzzer (5V / ~30mA) on GPIO7 via NPN transistor (not direct).
 // Bench-tested: steady tone on plain 5V DC = built-in oscillator, so drive it on/off.
-// Set BUZZER_SELF_DRIVE 0 to drive a passive buzzer with a BUZZER_FREQ_HZ square wave.
+// Beep timing runs on an esp_timer, so it stays short even if loop() is blocked.
 #define BUZZER_PIN         7
-#define BUZZER_FREQ_HZ     2300
-#define BUZZER_SELF_DRIVE  1
+#define BEEP_TAP_MS        15         // tap / confirm
+#define BEEP_TICK_MS       8          // each status step while holding
 
 
 // ---------------------- Adafruit IO (AIO) -----------------------------
@@ -1178,89 +1180,103 @@ static void handleSaveHardware(){
 }
  
 // ---------------------- Buzzer (TDB05LFPN) ----------------------------
-// Non-blocking: beep(count,onMs,offMs) queues a pattern, serviceBuzzer() runs it.
-static uint8_t  buzzLeft  = 0;
-static uint16_t buzzOnMs  = 0, buzzOffMs = 0;
-static bool     buzzOn    = false;
-static uint32_t buzzNextMs = 0;
+// beep(count,onMs,offMs) runs the pattern from an esp_timer callback.
+static esp_timer_handle_t buzzTimer = nullptr;
+static volatile uint8_t  buzzLeft  = 0;
+static volatile uint16_t buzzOnMs  = 0, buzzOffMs = 0;
+static volatile bool     buzzOn    = false;
 
-static void buzzerWrite(bool on){
-#if BUZZER_SELF_DRIVE
-  digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
-#else
-  if (on) tone(BUZZER_PIN, BUZZER_FREQ_HZ); else noTone(BUZZER_PIN);
-#endif
-  buzzOn = on;
-}
-static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
-  if (!count) return;
-  buzzLeft = count; buzzOnMs = onMs; buzzOffMs = offMs;
-  buzzerWrite(true); buzzNextMs = millis() + onMs;
-}
-static void serviceBuzzer(){
-  if (!buzzOn && !buzzLeft) return;
-  if ((long)(millis() - buzzNextMs) < 0) return;
+static void buzzerWrite(bool on){ digitalWrite(BUZZER_PIN, on ? HIGH : LOW); buzzOn = on; }
+static void buzzTimerCb(void*){
   if (buzzOn){
     buzzerWrite(false);
     if (buzzLeft) --buzzLeft;
-    buzzNextMs = millis() + buzzOffMs;
+    if (buzzLeft) esp_timer_start_once(buzzTimer, (uint64_t)buzzOffMs * 1000ULL);
   } else if (buzzLeft){
-    buzzerWrite(true); buzzNextMs = millis() + buzzOnMs;
+    buzzerWrite(true);
+    esp_timer_start_once(buzzTimer, (uint64_t)buzzOnMs * 1000ULL);
   }
+}
+static void buzzerInit(){
+  pinMode(BUZZER_PIN, OUTPUT); buzzerWrite(false);
+  const esp_timer_create_args_t a = { .callback = &buzzTimerCb, .arg = nullptr,
+                                      .dispatch_method = ESP_TIMER_TASK, .name = "buzz" };
+  esp_timer_create(&a, &buzzTimer);
+}
+static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
+  if (!count || !buzzTimer) return;
+  esp_timer_stop(buzzTimer);
+  buzzLeft = count; buzzOnMs = onMs; buzzOffMs = offMs;
+  buzzerWrite(true);
+  esp_timer_start_once(buzzTimer, (uint64_t)onMs * 1000ULL);
 }
 
 // ---------------------- Touch (HW-139) -------------------------------
-// Tap: toggle power (restores the last effect/color).
-// Hold >= TOUCH_LONG_MS: cycle presence Available -> Busy -> Away.
-static effect   lastOnEffect   = SOLID;
-static uint8_t  touchPresence  = 0;
+// Tap (< TOUCH_STEP_MS): on -> off; off -> last mode used, or Party if none yet.
+// Hold: every TOUCH_STEP_MS the light previews the next status
+// (Available -> Busy -> Away -> ...); releasing applies the one showing.
+static const char* const TOUCH_STATUS[]   = { "available", "busy", "away" };
+static const uint32_t    TOUCH_STATUS_RGB[] = { 0x00FF00, 0xFF0000, 0x0000FF };
+static const int         TOUCH_STATUS_N   = 3;
+
+static effect   lastOnEffect   = OFF;     // OFF = no mode used yet since boot
 static bool     touchStable    = false;   // debounced state
 static bool     touchRaw       = false;
 static uint32_t touchRawMs     = 0;
 static uint32_t touchDownMs    = 0;
-static bool     touchLongDone  = false;
+static int      touchPreview   = -1;      // index into TOUCH_STATUS, -1 = not previewing
 
-static void touchTogglePower(){
+static void touchTap(){
   stopDiscoveryBlink(true);
   if (powerState && currentEffect!=OFF){
-    lastOnEffect = currentEffect;
     currentEffect = OFF; powerState = false; setAllPixels(0);
   } else {
-    currentEffect = (lastOnEffect==OFF) ? SOLID : lastOnEffect;
+    currentEffect = (lastOnEffect==OFF) ? PARTY : lastOnEffect;
     effectPosition = 0; effectDirection = 1;
     if (currentEffect==PULSE) pulseResetRequested = true;
     powerState = true;
     if (currentEffect==SOLID) setAllPixels(currentColor);
   }
-  beep(1, 40);
+  beep(1, BEEP_TAP_MS);
   Serial.printf("[TOUCH] tap -> %s\n", getEffectName().c_str());
-}
-static void touchCyclePresence(){
-  static const char* const P[] = { "available", "busy", "away" };
-  stopDiscoveryBlink(true);
-  applyPresence(P[touchPresence]);
-  beep(touchPresence + 1, 40, 90);   // 1 = available, 2 = busy, 3 = away
-  Serial.printf("[TOUCH] hold -> %s\n", P[touchPresence]);
-  touchPresence = (touchPresence + 1) % 3;
 }
 static void serviceTouch(){
   const uint32_t now = millis();
+  // Remember the last "on" mode from any source (web, AIO, touch) for tap-to-restore.
+  if (powerState && currentEffect!=OFF) lastOnEffect = currentEffect;
+
   const bool raw = (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE);
   if (raw != touchRaw){ touchRaw = raw; touchRawMs = now; }
   if (raw != touchStable && (now - touchRawMs) >= TOUCH_DEBOUNCE_MS){
     touchStable = raw;
-    if (touchStable){ touchDownMs = now; touchLongDone = false; }
-    else if (!touchLongDone) touchTogglePower();
+    if (touchStable){ touchDownMs = now; touchPreview = -1; }
+    else if (touchPreview < 0) touchTap();
+    else {
+      const char* st = TOUCH_STATUS[touchPreview];
+      touchPreview = -1;
+      applyPresence(st);
+      beep(1, BEEP_TAP_MS);
+      Serial.printf("[TOUCH] hold -> %s\n", st);
+    }
   }
-  if (touchStable && !touchLongDone && (now - touchDownMs) >= TOUCH_LONG_MS){
-    touchLongDone = true;
-    touchCyclePresence();
+  if (touchStable){
+    const uint32_t held = now - touchDownMs;
+    if (held >= TOUCH_STEP_MS){
+      const int idx = (int)((held / TOUCH_STEP_MS - 1) % TOUCH_STATUS_N);
+      if (idx != touchPreview){
+        if (touchPreview < 0) stopDiscoveryBlink(true);
+        touchPreview = idx;
+        const uint32_t c = TOUCH_STATUS_RGB[idx];
+        setAllPixels(RGB((c>>16)&0xFF, (c>>8)&0xFF, c&0xFF));
+        beep(1, BEEP_TICK_MS);
+      }
+    }
   }
 }
 
 // ---------------------- Setup / Loop ---------------------------------
 void setup(){
-  pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);   // buzzer silent ASAP
+  buzzerInit();   // buzzer silent ASAP
   delay(200);
   Serial.begin(115200);
   uint32_t t0 = millis(); while (!Serial && (millis()-t0)<2500) delay(10);
@@ -1351,9 +1367,8 @@ void loop(){
   mqtt.loop();
   ArduinoOTA.handle();
   serviceTouch();
-  serviceBuzzer();
  
-  if (!statusActive){
+  if (!statusActive && touchPreview < 0){
     switch (currentEffect){
       case BLINK:        handleBlink(); break;
       case PARTY:        handleParty(); break;
