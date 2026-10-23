@@ -1,6 +1,6 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.9.2-c3
+// Version: 1.10.0-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off; 1/2/3 taps + hold = cycle
@@ -9,6 +9,8 @@
 //  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO "beep" (count, {count,on,off}, or [ms,...])
 //  - AIO "poll": devices post "onair-pong" to group "checkin"; devices in that
 //    group list who replied (and who didn't) on their main page
+//  - Layout option Ring / Stop light (paired up/down strips, 3 lamps); Traffic mode;
+//    per-lamp control (web + AIO "lamps"); editable lamp colours / traffic times
 //  - Keeps: AIO instant re-subscribe, LED Gap, Last AIO msg, OTA, etc.
 // =====================================================================
 
@@ -34,7 +36,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.9.2-c3"
+#define FIRMWARE_VERSION   "1.10.0-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -73,6 +75,7 @@ static const char* GROUPS_FILE     = "/groups.txt";       // AIO group list
 static const char* FORGET_FILE     = "/forget.flag";      // one-shot: force portal next boot
 static const char* OTAONLY_FILE    = "/otaonly.flag";     // recovery flag
 static const char* HW_FILE         = "/hw.txt";           // "pin,count,gap"
+static const char* STOPLIGHT_FILE  = "/stoplight.txt";   // "bot,mid,top colours (hex),green,yellow,red ms"
 static const char* TOUCH_FILE      = "/touch.txt";        // "debounce,gap,hold,step,comet,beep"
 static const char* LASTMSG_FILE    = "/lastmsg.json";     // persists last AIO message
 static const char* ROSTER_FILE     = "/roster.json";      // check-in roster (known devices)
@@ -81,6 +84,31 @@ static const char* ROSTER_FILE     = "/roster.json";      // check-in roster (kn
 static uint16_t gLedCount = DEFAULT_LED_COUNT;
 static uint8_t  gLedPin   = DEFAULT_LED_PIN;
 static uint16_t gLedGap   = DEFAULT_LED_GAP;
+
+// LED layout (4th field of /hw.txt)
+//  RING      : LEDs used in order (the original pucks).
+//  STOPLIGHT : two strips in one strand running up then back down, so LED n and
+//              LED (count+1-n) sit side by side. Effects run on those pairs ("rows",
+//              row 0 = bottom). Lamps are 4 rows each: bottom 0-3, middle 6-9, top 12-15;
+//              rows 4-5 and 10-11 are dividers, dark only in lamp modes (presence,
+//              Traffic, per-lamp control). Built for 32 LEDs (16 rows).
+enum LedLayout : uint8_t { LAYOUT_RING = 0, LAYOUT_STOPLIGHT = 1 };
+static uint8_t gLayout = LAYOUT_RING;
+
+enum LampIdx : uint8_t { LAMP_BOTTOM = 0, LAMP_MIDDLE = 1, LAMP_TOP = 2 };
+static const uint8_t LAMP_ROW0[3] = { 0, 6, 12 };
+#define LAMP_ROWS 4
+// Editable on /advanced (saved in /stoplight.txt): lamp colours (also the Traffic
+// phase colours) and Traffic phase times (green, yellow, red).
+#define DEFAULT_LAMP_BOTTOM  0x00FF00
+#define DEFAULT_LAMP_MIDDLE  0xFFA000
+#define DEFAULT_LAMP_TOP     0xFF0000
+static uint32_t gLampDefault[3] = { DEFAULT_LAMP_BOTTOM, DEFAULT_LAMP_MIDDLE, DEFAULT_LAMP_TOP };
+static uint32_t gTrafficMs[3]   = { 5000, 2000, 5000 };
+// Current per-lamp state (LAMPS mode)
+static bool     lampOn[3]    = { false, false, false };
+static uint32_t lampColor[3] = { DEFAULT_LAMP_BOTTOM, DEFAULT_LAMP_MIDDLE, DEFAULT_LAMP_TOP };
+static bool     trafficRestart = true, trafficRedraw = false;
 
 // Touch / buzzer settings (ms unless noted)
 static uint16_t gTouchDebounceMs = DEFAULT_TOUCH_DEBOUNCE_MS;
@@ -108,7 +136,7 @@ static String   lastMsgPayload = "-";
 static uint32_t lastMsgMs      = 0;
  
 // UI / effects
-enum effect { OFF, SOLID, BLINK, PARTY, KNIGHT_RIDER, BREATHE, COMET, RAINBOW, PULSE };
+enum effect { OFF, SOLID, BLINK, PARTY, KNIGHT_RIDER, BREATHE, COMET, RAINBOW, PULSE, LAMPS, TRAFFIC };
 effect currentEffect = OFF;      // Boot OFF
 bool   powerState    = false;    // Boot OFF
  
@@ -178,6 +206,38 @@ static inline void setAllPixels(uint32_t col){
   for(int i=0;i<strip.numPixels();++i) strip.setPixelColor(i,col);
   strip.show();
 }
+
+// ---------------------- Layout mapping --------------------------------
+// Effects draw on "logical pixels": every LED (ring) or every row (stop light).
+static inline bool isStoplight(){ return gLayout == LAYOUT_STOPLIGHT; }
+static inline int  lpCount(){ return isStoplight() ? ((int)gLedCount + 1) / 2 : (int)gLedCount; }
+static inline void lpSet(int i, uint32_t c){
+  if (i < 0 || i >= lpCount()) return;
+  strip.setPixelColor(i, c);
+  if (isStoplight()){ int j = (int)gLedCount - 1 - i; if (j != i && j >= 0) strip.setPixelColor(j, c); }
+}
+static inline uint32_t lpGet(int i){ return strip.getPixelColor(i); }
+
+// Lamps (stop light): only the chosen lamps lit, dividers dark.
+static void renderLampSet(const bool on[3], const uint32_t col[3]){
+  strip.setBrightness(globalBrightness);
+  strip.clear();
+  for (int l=0; l<3; ++l)
+    if (on[l]) for (int r=0; r<LAMP_ROWS; ++r) lpSet(LAMP_ROW0[l] + r, col[l]);
+  strip.show();
+}
+static void renderLamps(){ renderLampSet(lampOn, lampColor); }
+// Discovery / portal marker: middle 6 LEDs (ring) or the middle lamp (stop light).
+static void drawMiddleMarker(uint32_t c){
+  strip.setBrightness(globalBrightness);
+  if (isStoplight()){
+    for (int r=0; r<LAMP_ROWS; ++r) lpSet(LAMP_ROW0[LAMP_MIDDLE] + r, c);
+  } else {
+    int n=strip.numPixels(), mid=n/2;
+    for (int i=mid-3;i<=mid+2 && i<n;++i) if (i>=0) strip.setPixelColor(i, c);
+  }
+  strip.show();
+}
 // WiFi.setAutoConnect() was removed in Arduino-ESP32 core 3.x; no-op there.
 static inline void wifiSetAutoConnect(bool on){
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || ESP_ARDUINO_VERSION_MAJOR < 3
@@ -239,18 +299,50 @@ static void loadHardwareCfg(){
   gLedPin   = DEFAULT_LED_PIN;
   gLedCount = DEFAULT_LED_COUNT;
   gLedGap   = DEFAULT_LED_GAP;
+  gLayout   = LAYOUT_RING;
   if (!LittleFS.exists(HW_FILE)) return;
   File f = LittleFS.open(HW_FILE, "r"); if (!f) return;
   String line = f.readStringUntil('\n'); f.close(); line.trim();
   if (!line.length()) return;
   int p1 = line.indexOf(','), p2 = line.indexOf(',', p1+1);
   if (p1<0 || p2<0) return;
+  int p3 = line.indexOf(',', p2+1);   // optional 4th field: layout
   int pin  = line.substring(0,p1).toInt();
   int cnt  = line.substring(p1+1,p2).toInt();
-  int gap  = line.substring(p2+1).toInt();
+  int gap  = line.substring(p2+1, p3<0 ? line.length() : p3).toInt();
+  int lay  = p3<0 ? LAYOUT_RING : line.substring(p3+1).toInt();
+  gLayout = (lay==LAYOUT_STOPLIGHT) ? LAYOUT_STOPLIGHT : LAYOUT_RING;
   if (pin>=0 && pin<=21) gLedPin = (uint8_t)pin;
   if (cnt>=1 && cnt<=600) gLedCount = (uint16_t)cnt;
   if (gap>=0 && gap<=gLedCount*2) gLedGap = (uint16_t)gap;
+}
+// Stop light cfg: "bot,mid,top" colours as hex, then green,yellow,red phase ms.
+static void loadStoplightCfg(){
+  if (LittleFS.exists(STOPLIGHT_FILE)){
+    File f = LittleFS.open(STOPLIGHT_FILE, "r");
+    if (f){
+      String line = f.readStringUntil('\n'); f.close(); line.trim();
+      String v[6]; int n = 0, from = 0;
+      while (n < 6){
+        int c = line.indexOf(',', from);
+        v[n++] = line.substring(from, c < 0 ? line.length() : c);
+        if (c < 0) break;
+        from = c + 1;
+      }
+      if (n == 6){
+        for (int i=0;i<3;++i) gLampDefault[i] = (uint32_t)strtoul(v[i].c_str(), nullptr, 16) & 0xFFFFFF;
+        for (int i=0;i<3;++i) gTrafficMs[i] = constrain(v[3+i].toInt(), 200L, 600000L);
+      }
+    }
+  }
+  for (int i=0;i<3;++i) lampColor[i] = gLampDefault[i];
+}
+static void saveStoplightCfg(){
+  File f = LittleFS.open(STOPLIGHT_FILE, "w"); if (!f) return;
+  f.printf("%06lX,%06lX,%06lX,%lu,%lu,%lu\n",
+    (unsigned long)gLampDefault[0], (unsigned long)gLampDefault[1], (unsigned long)gLampDefault[2],
+    (unsigned long)gTrafficMs[0], (unsigned long)gTrafficMs[1], (unsigned long)gTrafficMs[2]);
+  f.close();
 }
 // Touch cfg: "debounce,gap,hold,step,comet,beep". Values are clamped to the UI ranges
 // (as long, before narrowing, so out-of-range input can't wrap).
@@ -284,7 +376,7 @@ static void saveTouchCfg(){
 }
 static void saveHardwareCfg(){
   File f = LittleFS.open(HW_FILE, "w"); if (!f) return;
-  f.printf("%u,%u,%u\n", (unsigned)gLedPin, (unsigned)gLedCount, (unsigned)gLedGap);
+  f.printf("%u,%u,%u,%u\n", (unsigned)gLedPin, (unsigned)gLedCount, (unsigned)gLedGap, (unsigned)gLayout);
   f.close();
 }
  
@@ -336,20 +428,22 @@ static String getEffectName(){
     case SOLID: return "Solid"; case BLINK: return "Blink"; case PARTY: return "Party";
     case KNIGHT_RIDER: return "Knight Rider"; case BREATHE: return "Breathe";
     case COMET: return "Comet"; case RAINBOW: return "Rainbow"; case PULSE: return "Pulse";
+    case LAMPS: return "Lamps"; case TRAFFIC: return "Traffic";
     case OFF: default: return "Off";
   }
 }
  
 // ---------------------- Progress bar ----------------------------------
 static void drawProgressBar(uint32_t color, float frac){
-  uint16_t n = strip.numPixels(); if (n==0) return;
+  uint16_t n = lpCount(); if (n==0) return;
+  strip.clear();
   if (frac<0) frac=0; if (frac>1) frac=1;
   int filled = (int)floor(frac * n);
-  for (uint16_t i=0;i<n;++i) strip.setPixelColor(i, 0);
-  for (int i=0;i<filled && i<(int)n; ++i) strip.setPixelColor(i, color);
+  for (uint16_t i=0;i<n;++i) lpSet(i, 0);
+  for (int i=0;i<filled && i<(int)n; ++i) lpSet(i, color);
   if (filled < (int)n){
     uint8_t r=(color>>16)&0xFF, g=(color>>8)&0xFF, b=color&0xFF;
-    strip.setPixelColor(filled, RGB(r/4,g/4,b/4));
+    lpSet(filled, RGB(r/4,g/4,b/4));
   }
   strip.setBrightness(globalBrightness);
   strip.show();
@@ -362,13 +456,13 @@ static void drawProgressBarAndDelay(uint32_t color, uint32_t s, uint32_t ms){
 }
  
 // ---------------------- Virtual ring helpers (gap support) ------------
-static inline int virtRingLen(){ return (int)gLedCount + (int)gLedGap; }
+static inline int virtRingLen(){ return isStoplight() ? lpCount() : (int)gLedCount + (int)gLedGap; }
 static inline int virtToPhysical(int vpos){
   int V = virtRingLen();
   if (V<=0) return -1;
   vpos %= V; if (vpos<0) vpos += V;
-  if (vpos >= (int)gLedCount) return -1;   // inside the gap
-  return vpos;                              // direct mapping (gap at the end)
+  if (vpos >= lpCount()) return -1;        // inside the gap
+  return vpos;                              // logical index (gap at the end)
 }
  
 // ---------------------- Effects --------------------------------------
@@ -384,8 +478,8 @@ static void handleParty(){
   if (millis()-lastUpdate > delayFor(PARTY)){
     lastUpdate=millis();
     strip.setBrightness(globalBrightness);
-    for (int i=0;i<strip.numPixels();++i) strip.setPixelColor(i, RGB(random(25),random(25),random(25)));
-    for (int i=0;i<3;++i){ float rnd=fmod(targetHue+(random(-60,61)/360.0f)+1.0f,1.0f); strip.setPixelColor(random(strip.numPixels()), hsvToRgb(rnd,1.0f,1.0f)); }
+    for (int i=0;i<lpCount();++i) lpSet(i, RGB(random(25),random(25),random(25)));
+    for (int i=0;i<3;++i){ float rnd=fmod(targetHue+(random(-60,61)/360.0f)+1.0f,1.0f); lpSet(random(lpCount()), hsvToRgb(rnd,1.0f,1.0f)); }
     strip.show();
   }
 }
@@ -393,20 +487,20 @@ static void handleKnightRider(){
   if (millis()-lastUpdate > delayFor(KNIGHT_RIDER)){
     lastUpdate=millis();
     strip.setBrightness(globalBrightness);
-    for (int i=0;i<strip.numPixels();++i){
-      uint32_t c=strip.getPixelColor(i);
+    for (int i=0;i<lpCount();++i){
+      uint32_t c=lpGet(i);
       uint8_t r=((c>>16)&0xFF)*0.7, g=((c>>8)&0xFF)*0.7, b=(c&0xFF)*0.7;
-      strip.setPixelColor(i, RGB(r,g,b));
+      lpSet(i, RGB(r,g,b));
     }
     uint8_t r=(currentColor>>16)&0xFF, g=(currentColor>>8)&0xFF, b=currentColor&0xFF;
-    if (effectPosition>1) { strip.setPixelColor(effectPosition-2, RGB(r/8,g/8,b/8)); }
-    if (effectPosition>0) { strip.setPixelColor(effectPosition-1, RGB(r/2,g/2,b/2)); }
-    strip.setPixelColor(effectPosition, RGB(r,g,b));
-    if (effectPosition<strip.numPixels()-1) { strip.setPixelColor(effectPosition+1, RGB(r/2,g/2,b/2)); }
-    if (effectPosition<strip.numPixels()-2) { strip.setPixelColor(effectPosition+2, RGB(r/8,g/8,b/8)); }
+    if (effectPosition>1) { lpSet(effectPosition-2, RGB(r/8,g/8,b/8)); }
+    if (effectPosition>0) { lpSet(effectPosition-1, RGB(r/2,g/2,b/2)); }
+    lpSet(effectPosition, RGB(r,g,b));
+    if (effectPosition<lpCount()-1) { lpSet(effectPosition+1, RGB(r/2,g/2,b/2)); }
+    if (effectPosition<lpCount()-2) { lpSet(effectPosition+2, RGB(r/8,g/8,b/8)); }
     strip.show();
     effectPosition+=effectDirection;
-    if (effectPosition<0 || effectPosition>=strip.numPixels()){ effectDirection*=-1; effectPosition+=effectDirection; }
+    if (effectPosition<0 || effectPosition>=lpCount()){ effectDirection*=-1; effectPosition+=effectDirection; }
   }
 }
 static void handleBreathe(){
@@ -425,15 +519,15 @@ static void handleComet(){
   if (millis()-lastUpdate > delayFor(COMET)){
     lastUpdate=millis();
     strip.setBrightness(globalBrightness);
-    for (int i=0;i<strip.numPixels();++i){
-      uint32_t c=strip.getPixelColor(i);
+    for (int i=0;i<lpCount();++i){
+      uint32_t c=lpGet(i);
       uint8_t r=((c>>16)&0xFF)*0.8, g=((c>>8)&0xFF)*0.8, b=(c&0xFF)*0.8;
-      strip.setPixelColor(i, RGB(r,g,b));
+      lpSet(i, RGB(r,g,b));
     }
     static int vpos = 0;
     int phys = virtToPhysical(vpos);
     uint8_t r=(currentColor>>16)&0xFF, g=(currentColor>>8)&0xFF, b=currentColor&0xFF;
-    if (phys >= 0) strip.setPixelColor(phys, RGB(r,g,b));
+    if (phys >= 0) lpSet(phys, RGB(r,g,b));
     strip.show();
     vpos = (vpos + 1) % max(1, virtRingLen());
   }
@@ -450,11 +544,11 @@ static void handleRainbow(){
     base = (base + step) & 0xFFFF;
  
     const int V = max(1, virtRingLen());
-    for (int i = 0; i < (int)gLedCount; ++i){
-      const int v = (int)(( (long)i * V ) / (long)gLedCount);
+    for (int i = 0; i < lpCount(); ++i){
+      const int v = (int)(( (long)i * V ) / (long)lpCount());
       const uint16_t vphase = (uint32_t)v * 65535UL / (uint32_t)V;
       const float h = ((uint16_t)(base + vphase)) / 65535.0f;
-      strip.setPixelColor(i, hsvToRgb(h, 1.0f, 1.0f));
+      lpSet(i, hsvToRgb(h, 1.0f, 1.0f));
     }
     strip.show();
   }
@@ -465,22 +559,22 @@ static void handlePulse() {
   if (millis() - lastUpdate > delayFor(PULSE)) {
     lastUpdate = millis();
     strip.setBrightness(globalBrightness);
-    const int n = strip.numPixels(); if (n <= 0) return;
+    const int n = lpCount(); if (n <= 0) return;
     for (int i=0;i<n;i++){
-      uint32_t c=strip.getPixelColor(i);
+      uint32_t c=lpGet(i);
       uint8_t r=((c>>16)&0xFF)*7/10, g=((c>>8)&0xFF)*7/10, b=(c&0xFF)*7/10;
-      strip.setPixelColor(i, strip.Color(r,g,b));
+      lpSet(i, strip.Color(r,g,b));
     }
     const int left=pPos, right=(n-1)-pPos;
     uint8_t r=(currentColor>>16)&0xFF, g=(currentColor>>8)&0xFF, b=currentColor&0xFF;
-    if (left  >=0 && left  < n) strip.setPixelColor(left,  strip.Color(r,g,b));
-    if (right >=0 && right < n) strip.setPixelColor(right, strip.Color(r,g,b));
-    if (left-1  >= 0) strip.setPixelColor(left-1,  strip.Color(r/2,g/2,b/2));
-    if (right+1 <  n) strip.setPixelColor(right+1, strip.Color(r/2,g/2,b/2));
+    if (left  >=0 && left  < n) lpSet(left,  strip.Color(r,g,b));
+    if (right >=0 && right < n) lpSet(right, strip.Color(r,g,b));
+    if (left-1  >= 0) lpSet(left-1,  strip.Color(r/2,g/2,b/2));
+    if (right+1 <  n) lpSet(right+1, strip.Color(r/2,g/2,b/2));
     bool oddCenter = (left==right), evenNeck = ((right-left)==1);
     if (!oddCenter && !evenNeck){
-      if (left+1  <  n) strip.setPixelColor(left+1,  strip.Color(r/3,g/3,b/3));
-      if (right-1 >= 0) strip.setPixelColor(right-1, strip.Color(r/3,g/3,b/3));
+      if (left+1  <  n) lpSet(left+1,  strip.Color(r/3,g/3,b/3));
+      if (right-1 >= 0) lpSet(right-1, strip.Color(r/3,g/3,b/3));
     }
     strip.show();
     if (pDir > 0) { if (oddCenter || evenNeck) pDir = -1; else pPos++; }
@@ -488,6 +582,32 @@ static void handlePulse() {
   }
 }
  
+// TRAFFIC: green -> yellow -> red, phase times from gTrafficMs. Stop light: one
+// lamp at a time; ring: whole ring in the phase colour.
+static void handleTraffic(){
+  static uint8_t  phase = 0;
+  static uint32_t phaseStart = 0;
+  const uint32_t now = millis();
+  bool draw = false;
+  if (trafficRestart){ trafficRestart = false; phase = 0; phaseStart = now; draw = true; }
+  else if (now - phaseStart >= gTrafficMs[phase]){ phase = (phase + 1) % 3; phaseStart = now; draw = true; }
+  if (trafficRedraw){ trafficRedraw = false; draw = true; }
+  if (!draw) return;
+  if (isStoplight()){
+    bool on[3] = { phase==0, phase==1, phase==2 };   // 0 bottom/green, 1 middle/yellow, 2 top/red
+    renderLampSet(on, gLampDefault);
+  } else {
+    setAllPixels(gLampDefault[phase]);
+  }
+}
+// Redraws modes that don't animate. Returns false if the caller should handle it.
+static bool redrawStatic(){
+  if (currentEffect==SOLID){ setAllPixels(currentColor); return true; }
+  if (currentEffect==LAMPS){ renderLamps(); return true; }
+  if (currentEffect==TRAFFIC){ trafficRedraw = true; return true; }
+  return false;
+}
+
 // ---------------------- Blink service --------------------------------
 static void serviceBlink(){
   if (!blinkActive) return;
@@ -498,10 +618,7 @@ static void serviceBlink(){
   if (blinkPhase){
     if (blinkMode==BLINK_ALL_PURPLE){ setAllPixels(RGB(128,0,255)); }
     else if (blinkMode==BLINK_MIDDLE6_PURPLE){
-      int n=strip.numPixels(), mid=n/2;
-      strip.setBrightness(globalBrightness);
-      for (int i=mid-3;i<=mid+2 && i<n;++i) if (i>=0) strip.setPixelColor(i, RGB(128,0,255));
-      strip.show();
+      drawMiddleMarker(RGB(128,0,255));
     }
   }
 }
@@ -526,10 +643,7 @@ static void startEphemeralAPWithStaIP(uint32_t durationMs=60000){
 static void showPortalStaticPurple(bool on){
   setAllPixels(0);
   if (on){
-    int n=strip.numPixels(), mid=n/2;
-    strip.setBrightness(globalBrightness);
-    for (int i=mid-3;i<=mid+2 && i<n;++i) if (i>=0) strip.setPixelColor(i, RGB(128,0,255));
-    strip.show();
+    drawMiddleMarker(RGB(128,0,255));
   }
 }
 // Known networks: the ones this device has joined (/wifi.txt, most recent first),
@@ -750,7 +864,33 @@ static unsigned long speedToDelay(int s){
   int v = s; if (v > 100) v = map(v, 10, 200, 0, 100); v = constrain(v, 0, 100);
   float k = 0.035f; float d = 200.0f * expf(-k * v); if (d < 8.0f) d = 8.0f; return (unsigned long)d;
 }
+// Colour from JSON: [r,g,b] or "#rrggbb".
+static bool parseColorVar(JsonVariantConst v, uint32_t& out){
+  if (v.is<JsonArrayConst>()){
+    JsonArrayConst a = v.as<JsonArrayConst>();
+    if (a.size() < 3) return false;
+    out = ((uint32_t)constrain((int)a[0],0,255) << 16) | ((uint32_t)constrain((int)a[1],0,255) << 8) | (uint32_t)constrain((int)a[2],0,255);
+    return true;
+  }
+  if (v.is<const char*>()){
+    const char* t = v.as<const char*>();
+    if (*t == '#') ++t;
+    if (strlen(t) != 6) return false;
+    out = (uint32_t)strtoul(t, nullptr, 16) & 0xFFFFFF;
+    return true;
+  }
+  return false;
+}
 static void applyPresence(const String& m){
+  if (isStoplight()){
+    // Traffic-light style: Busy = top, Away = middle, Available = bottom, one lamp lit.
+    const int l = (m=="available") ? LAMP_BOTTOM : (m=="away") ? LAMP_MIDDLE : LAMP_TOP;
+    for (int i=0;i<3;++i){ lampOn[i] = (i==l); lampColor[i] = gLampDefault[i]; }
+    const uint32_t c = gLampDefault[l];
+    applyColorPreserveBrightness((c>>16)&0xFF, (c>>8)&0xFF, c&0xFF);
+    currentEffect = LAMPS; powerState = true; renderLamps();
+    return;
+  }
   uint8_t rr=0,gg=0,bb=0;
   if (m=="available") { rr=0;   gg=255; bb=0;   }
   else if (m=="away") { rr=0;   gg=0;   bb=255; }
@@ -888,8 +1028,7 @@ static void applyCommand(const JsonObject& obj, const String& srcTopic, const St
     int br = constrain((int)obj["brightness"],0,100);
     globalBrightness = brightness255FromPct(br);
     if (powerState) {
-      if (currentEffect==SOLID) setAllPixels(currentColor);
-      else { strip.setBrightness(globalBrightness); strip.show(); if (currentEffect==PULSE) pulseResetRequested=true; }
+      if (!redrawStatic()) { strip.setBrightness(globalBrightness); strip.show(); if (currentEffect==PULSE) pulseResetRequested=true; }
     }
   }
   if (obj["color"].is<JsonArray>()){
@@ -905,6 +1044,26 @@ static void applyCommand(const JsonObject& obj, const String& srcTopic, const St
     effectDelay = speedToDelay((int)obj["speed"]);
     if (currentEffect==PULSE) pulseResetRequested = true;
   }
+  // "lamps": {"top": true|false|[r,g,b]|"#rrggbb", "middle": ..., "bottom": ...}
+  // Stop light layout only. Lamps not mentioned keep their state if already in lamp mode.
+  if (obj["lamps"].is<JsonObjectConst>()){
+    if (!isStoplight()) Serial.println(F("[AIO] \"lamps\" ignored: layout is Ring"));
+    else {
+      if (currentEffect != LAMPS) for (int i=0;i<3;++i){ lampOn[i] = false; lampColor[i] = gLampDefault[i]; }
+      JsonObjectConst lo = obj["lamps"].as<JsonObjectConst>();
+      static const char* const KEYS[3] = { "bottom", "middle", "top" };
+      for (int i=0;i<3;++i){
+        JsonVariantConst v = lo[KEYS[i]];
+        if (v.isNull()) continue;
+        uint32_t c;
+        if (v.is<bool>())             { lampOn[i] = v.as<bool>(); }
+        else if (parseColorVar(v, c)) { lampOn[i] = true; lampColor[i] = c; }
+      }
+      currentEffect = LAMPS;
+      powerState = lampOn[0] || lampOn[1] || lampOn[2];
+      renderLamps();
+    }
+  }
   if (obj["mode"].is<const char*>()){
     String m=obj["mode"].as<const char*>(); m.trim(); m.toLowerCase(); m.replace('-', '_');
     if (m=="available" || m=="away" || m=="busy") { applyPresence(m); return; }
@@ -916,6 +1075,7 @@ static void applyCommand(const JsonObject& obj, const String& srcTopic, const St
     else if (m=="comet")         currentEffect=COMET;
     else if (m=="rainbow")       currentEffect=RAINBOW;
     else if (m=="pulse")         { currentEffect=PULSE; pulseResetRequested = true; }
+    else if (m=="traffic")       currentEffect=TRAFFIC;
     else if (m=="off")           { currentEffect=OFF; setAllPixels(0); powerState=false; return; }
     powerState=true;
     if (currentEffect==SOLID) setAllPixels(currentColor);
@@ -1210,6 +1370,22 @@ template<typename Out> static void renderCheckins(Out& out){
   out(F("</table></div>"));
   cardEnd();
 }
+// "Lamps" card (stop light): each lamp on/off + colour.
+template<typename Out> static void renderLampCard(Out& out){
+  static const char* const NAMES[3] = { "Bottom", "Middle", "Top" };
+  static const char* const KEYS[3]  = { "bot", "mid", "top" };
+  cardStart(F("Lamps"));
+  out(F("<form action='/lamps' method='get'>"));
+  for (int l=2; l>=0; --l){   // top first, like the light
+    const bool on = (currentEffect==LAMPS) && lampOn[l];
+    out(F("<div class='row'><label style='min-width:80px'><input type='checkbox' name='"));
+    out(KEYS[l]); out(F("_on'")); if (on) out(F(" checked")); out(F("> ")); out(NAMES[l]);
+    out(F("</label><input type='color' name='")); out(KEYS[l]); out(F("_c' value='"));
+    out(colorToHex(lampColor[l])); out(F("'></div>"));
+  }
+  out(F("<button class='btn' type='submit'>Apply</button></form>"));
+  cardEnd();
+}
 static void handleRoot(){
   if (discoveryBlinkActive) stopDiscoveryBlink(true);
   Serial.println("[HTTP] GET /");
@@ -1233,6 +1409,7 @@ static void handleRoot(){
         "<a class='btn' href='/set?effect=comet'>Comet</a>"
         "<a class='btn' href='/set?effect=rainbow'>Rainbow</a>"
         "<a class='btn' href='/set?effect=pulse'>Pulse</a>"
+        "<a class='btn' href='/set?effect=traffic'>Traffic</a>"
         "<a class='btn off' href='/set?effect=off'>OFF</a>"));
   cardEnd();
  
@@ -1242,6 +1419,8 @@ static void handleRoot(){
         "<a class='btn available' href='/set?preset=available'>Available</a>"
         "<a class='btn away' href='/set?preset=away'>Away</a>"));
   cardEnd();
+
+  if (isStoplight()) renderLampCard(out);
  
   // Color / Speed / Brightness
   cardStart(F("Color, Speed & Brightness"));
@@ -1310,9 +1489,36 @@ static void handleAdvanced(){
   out(String(gLedCount));
   out(F("'><div>Gap</div><input type='number' name='gap' min='0' max='1200' value='"));
   out(String(gLedGap));
-  out(F("'>"
+  out(F("'><div>Layout</div><select name='layout'><option value='0'"));
+  if (!isStoplight()) out(F(" selected"));
+  out(F(">Ring</option><option value='1'"));
+  if (isStoplight()) out(F(" selected"));
+  out(F(">Stop light</option></select>"
         "<button class='btn' type='submit'>Save & Reboot</button></form>"
-        "<p style='color:#bbb;margin:8px 0 0 0'>Gap makes circular effects move smoothly over the physical gap.</p>"));
+        "<p style='color:#bbb;margin:8px 0 0 0'>Gap makes circular effects move smoothly over the physical gap (Ring only). "
+        "Stop light: two strips up/down in one strand, Count 32.</p>"));
+  if (isStoplight() && gLedCount != 32)
+    out(F("<p style='color:#F44336;margin:6px 0 0 0'>Stop light layout expects Count 32.</p>"));
+  cardEnd();
+
+  // Stop light / Traffic
+  cardStart(F("Stop light / Traffic"));
+  out(F("<form action='/save_stoplight' method='get'>"
+        "<div class='row'><div>Top</div><input type='color' name='top' value='"));
+  out(colorToHex(gLampDefault[LAMP_TOP]));
+  out(F("'><div>Middle</div><input type='color' name='mid' value='"));
+  out(colorToHex(gLampDefault[LAMP_MIDDLE]));
+  out(F("'><div>Bottom</div><input type='color' name='bot' value='"));
+  out(colorToHex(gLampDefault[LAMP_BOTTOM]));
+  out(F("'></div><div class='row'><div>Green s</div><input type='number' name='tg' min='0.2' max='600' step='0.1' value='"));
+  out(String(gTrafficMs[0] / 1000.0f, 1));
+  out(F("'><div>Yellow s</div><input type='number' name='ty' min='0.2' max='600' step='0.1' value='"));
+  out(String(gTrafficMs[1] / 1000.0f, 1));
+  out(F("'><div>Red s</div><input type='number' name='tr' min='0.2' max='600' step='0.1' value='"));
+  out(String(gTrafficMs[2] / 1000.0f, 1));
+  out(F("'></div><button class='btn' type='submit'>Save</button></form>"
+        "<p style='color:#bbb;margin:8px 0 0 0'>Lamp colours are used by presence (stop light), "
+        "Traffic mode and as the starting colours on the Lamps card. Applies immediately.</p>"));
   cardEnd();
 
   // Touch / buzzer timing
@@ -1404,6 +1610,7 @@ static void handleSetEffect(){
     else if (e=="comet")         currentEffect=COMET;
     else if (e=="rainbow")       currentEffect=RAINBOW;
     else if (e=="pulse")         { currentEffect=PULSE; pulseResetRequested = true; }
+    else if (e=="traffic")       currentEffect=TRAFFIC;
     else if (e=="off")           { currentEffect=OFF; newPowerState=false; }
   }
   if (server.hasArg("speed")) {
@@ -1414,8 +1621,7 @@ static void handleSetEffect(){
     const int pct = constrain(server.arg("brightness").toInt(), 0, 100);
     globalBrightness = brightness255FromPct(pct);
     if (powerState) {
-      if (currentEffect == SOLID) setAllPixels(currentColor);
-      else { strip.setBrightness(globalBrightness); strip.show(); if (currentEffect==PULSE) pulseResetRequested=true; }
+      if (!redrawStatic()) { strip.setBrightness(globalBrightness); strip.show(); if (currentEffect==PULSE) pulseResetRequested=true; }
     }
   }
   if (server.hasArg("color")){
@@ -1502,6 +1708,36 @@ static void handleSaveTouch(){
     (unsigned)gTouchStepMs, (unsigned)gCometFastSpeed, (unsigned)gBeepMs);
   server.sendHeader("Location","/advanced"); server.send(302);
 }
+static uint32_t hexArg(const char* k, uint32_t cur){
+  if (!server.hasArg(k)) return cur;
+  String v = server.arg(k); if (v.startsWith("#")) v.remove(0,1);
+  if (v.length() != 6) return cur;
+  return (uint32_t)strtoul(v.c_str(), nullptr, 16) & 0xFFFFFF;
+}
+static void handleLamps(){
+  static const char* const KEYS[3] = { "bot", "mid", "top" };
+  stopDiscoveryBlink(true);
+  for (int l=0;l<3;++l){
+    String k = KEYS[l];
+    lampOn[l]    = server.hasArg(k + "_on");
+    lampColor[l] = hexArg((k + "_c").c_str(), lampColor[l]);
+  }
+  currentEffect = LAMPS;
+  powerState = lampOn[0] || lampOn[1] || lampOn[2];
+  renderLamps();
+  server.sendHeader("Location","/"); server.send(302);
+}
+static void handleSaveStoplight(){
+  gLampDefault[LAMP_TOP]    = hexArg("top", gLampDefault[LAMP_TOP]);
+  gLampDefault[LAMP_MIDDLE] = hexArg("mid", gLampDefault[LAMP_MIDDLE]);
+  gLampDefault[LAMP_BOTTOM] = hexArg("bot", gLampDefault[LAMP_BOTTOM]);
+  const char* T[3] = { "tg", "ty", "tr" };
+  for (int i=0;i<3;++i)
+    if (server.hasArg(T[i])) gTrafficMs[i] = (uint32_t)constrain((long)(server.arg(T[i]).toFloat() * 1000.0f), 200L, 600000L);
+  saveStoplightCfg();
+  if (currentEffect==TRAFFIC) trafficRedraw = true;
+  server.sendHeader("Location","/advanced"); server.send(302);
+}
 static void handleSaveHardware(){
   int pin   = server.hasArg("pin")   ? server.arg("pin").toInt()   : DEFAULT_LED_PIN;
   int count = server.hasArg("count") ? server.arg("count").toInt() : DEFAULT_LED_COUNT;
@@ -1512,6 +1748,7 @@ static void handleSaveHardware(){
   gLedPin   = (uint8_t)pin;
   gLedCount = (uint16_t)count;
   gLedGap   = (uint16_t)gap;
+  if (server.hasArg("layout")) gLayout = (server.arg("layout").toInt()==LAYOUT_STOPLIGHT) ? LAYOUT_STOPLIGHT : LAYOUT_RING;
   saveHardwareCfg();
   server.send(200,"text/plain","Saved. Rebooting to apply…");
   delay(300); ESP.restart();
@@ -1566,7 +1803,7 @@ static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
 // releasing keeps the one showing (confirm beep). Other tap counts are ignored.
 enum TouchCycle : uint8_t { TC_NONE, TC_FUN, TC_PRESENCE, TC_COMET };
 
-static const effect      FUN_EFFECTS[]  = { SOLID, BLINK, PARTY, KNIGHT_RIDER, BREATHE, COMET, RAINBOW, PULSE };
+static const effect      FUN_EFFECTS[]  = { SOLID, BLINK, PARTY, KNIGHT_RIDER, BREATHE, COMET, RAINBOW, PULSE, TRAFFIC };
 static const char* const PRESENCE[]     = { "available", "busy", "away" };
 static const uint32_t    COMET_COLORS[] = { 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF };
 #define ARRAY_LEN(a) (int)(sizeof(a)/sizeof((a)[0]))
@@ -1599,7 +1836,7 @@ static void touchToggle(){
     effectPosition = 0; effectDirection = 1;
     if (currentEffect==PULSE) pulseResetRequested = true;
     powerState = true;
-    setAllPixels(currentEffect==SOLID ? currentColor : 0);
+    if (!redrawStatic()) setAllPixels(0);
   }
   touchBeep();
   Serial.printf("[TOUCH] tap -> %s\n", getEffectName().c_str());
@@ -1621,7 +1858,7 @@ static void cycleApply(TouchCycle c, int i){
     effectPosition = 0; effectDirection = 1;
     if (currentEffect==PULSE) pulseResetRequested = true;
     powerState = true;
-    setAllPixels(currentEffect==SOLID ? currentColor : 0);
+    if (!redrawStatic()) setAllPixels(0);
   } else if (c==TC_PRESENCE){
     restoreSpeed();
     applyPresence(PRESENCE[i]);
@@ -1689,6 +1926,7 @@ void setup(){
     loadGroups();
     loadHardwareCfg();
     loadTouchCfg();
+    loadStoplightCfg();
     loadRoster();
     loadLastMsg();
     wifiStore.load();
@@ -1744,6 +1982,8 @@ void setup(){
   server.on("/otarecovery", handleOtaRecovery);
   server.on("/save_hw", handleSaveHardware);
   server.on("/save_touch", handleSaveTouch);
+  server.on("/lamps", handleLamps);
+  server.on("/save_stoplight", handleSaveStoplight);
   server.on("/poll", handlePollNow);
   server.on("/roster/clear", handleRosterClear);
  
@@ -1775,6 +2015,8 @@ void loop(){
   ArduinoOTA.handle();
   serviceTouch();
  
+  static effect prevEffect = OFF;
+  if (currentEffect != prevEffect){ prevEffect = currentEffect; if (currentEffect==TRAFFIC) trafficRestart = true; }
   if (!statusActive){
     switch (currentEffect){
       case BLINK:        handleBlink(); break;
@@ -1784,6 +2026,7 @@ void loop(){
       case COMET:        handleComet(); break;
       case RAINBOW:      handleRainbow(); break;
       case PULSE:        handlePulse(); break;
+      case TRAFFIC:      handleTraffic(); break;
       default: break;
     }
   }
