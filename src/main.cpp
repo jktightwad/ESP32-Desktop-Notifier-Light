@@ -1,9 +1,9 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.10.0-c3
+// Version: 1.10.1-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
-//  - HW-139 touch on GPIO10: tap = on/off; 1/2/3 taps + hold = cycle
+//  - HW-139 touch on GPIO10: tap = Available/Away; 1/2/3 taps + hold = cycle
 //    fun modes / presence / fast comet colours, release keeps
 //  - Touch/buzzer timings editable on /advanced (saved to /touch.txt)
 //  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO "beep" (count, {count,on,off}, or [ms,...])
@@ -36,7 +36,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.10.0-c3"
+#define FIRMWARE_VERSION   "1.10.1-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -881,6 +881,20 @@ static bool parseColorVar(JsonVariantConst v, uint32_t& out){
   }
   return false;
 }
+// Which presence status is showing, so a touch tap can toggle Available <-> Away.
+// Cleared implicitly when the mode, colour or power changes (see activePresence()).
+enum Presence : int8_t { PRES_NONE = -1, PRES_AVAILABLE = 0, PRES_AWAY = 1, PRES_BUSY = 2 };
+static int8_t   gPresence  = PRES_NONE;
+static effect   presEffect = OFF;
+static uint32_t presColor  = 0;
+static void notePresence(const String& m){
+  gPresence  = (m=="available") ? PRES_AVAILABLE : (m=="away") ? PRES_AWAY : PRES_BUSY;
+  presEffect = currentEffect; presColor = currentColor;
+}
+static int8_t activePresence(){
+  if (gPresence==PRES_NONE || !powerState || currentEffect!=presEffect || currentColor!=presColor) return PRES_NONE;
+  return gPresence;
+}
 static void applyPresence(const String& m){
   if (isStoplight()){
     // Traffic-light style: Busy = top, Away = middle, Available = bottom, one lamp lit.
@@ -889,6 +903,7 @@ static void applyPresence(const String& m){
     const uint32_t c = gLampDefault[l];
     applyColorPreserveBrightness((c>>16)&0xFF, (c>>8)&0xFF, c&0xFF);
     currentEffect = LAMPS; powerState = true; renderLamps();
+    notePresence(m);
     return;
   }
   uint8_t rr=0,gg=0,bb=0;
@@ -897,6 +912,7 @@ static void applyPresence(const String& m){
   else /* busy */     { rr=255; gg=0;   bb=0;   }
   applyColorPreserveBrightness(rr,gg,bb);
   currentEffect = SOLID; powerState = true; setAllPixels(currentColor);
+  notePresence(m);
 }
 static void recordLastMsg(const String& topic, const String& payload){
   lastMsgTopic = topic; lastMsgPayload = payload; lastMsgMs = millis();
@@ -1059,7 +1075,7 @@ static void applyCommand(const JsonObject& obj, const String& srcTopic, const St
         if (v.is<bool>())             { lampOn[i] = v.as<bool>(); }
         else if (parseColorVar(v, c)) { lampOn[i] = true; lampColor[i] = c; }
       }
-      currentEffect = LAMPS;
+      currentEffect = LAMPS; gPresence = PRES_NONE;
       powerState = lampOn[0] || lampOn[1] || lampOn[2];
       renderLamps();
     }
@@ -1540,7 +1556,7 @@ static void handleAdvanced(){
         "<button class='btn' type='submit'>Save</button></form>"
         "<a class='btn sm' href='/save_touch?defaults=1'>Defaults</a>"
         "<p style='color:#bbb;margin:8px 0 0 0'>"
-        "Tap = on/off. 1, 2 or 3 taps then hold = cycle fun modes / presence / fast comet colours.<br>"
+        "Tap = Available / Away. 1, 2 or 3 taps then hold = cycle modes / presence / fast comet colours.<br>"
         "Tap gap: max pause between taps. Hold: press length that starts a cycle. "
         "Step: time per mode while holding. Comet speed: 0-100. Beep 0 = silent. "
         "Applies immediately, no reboot.</p>"));
@@ -1722,7 +1738,7 @@ static void handleLamps(){
     lampOn[l]    = server.hasArg(k + "_on");
     lampColor[l] = hexArg((k + "_c").c_str(), lampColor[l]);
   }
-  currentEffect = LAMPS;
+  currentEffect = LAMPS; gPresence = PRES_NONE;
   powerState = lampOn[0] || lampOn[1] || lampOn[2];
   renderLamps();
   server.sendHeader("Location","/"); server.send(302);
@@ -1795,7 +1811,7 @@ static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
 
 // ---------------------- Touch (HW-139) -------------------------------
 // Gestures (a tap is any press+release; taps within gTouchGapMs chain together):
-//   tap (any length, nothing after)  -> on/off; on = last mode used, or Party if none yet
+//   tap (any length, nothing after)  -> Available <-> Away (from anything else: Available)
 //   1 tap, then hold                 -> cycle fun modes
 //   2 taps, then hold                -> cycle presence: Available / Busy / Away
 //   3 taps, then hold                -> fast comet cycling R/G/B/Y/C/M/White
@@ -1808,7 +1824,6 @@ static const char* const PRESENCE[]     = { "available", "busy", "away" };
 static const uint32_t    COMET_COLORS[] = { 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF };
 #define ARRAY_LEN(a) (int)(sizeof(a)/sizeof((a)[0]))
 
-static effect     lastOnEffect  = OFF;     // OFF = no mode used yet since boot
 static bool       touchStable   = false;   // debounced state
 static bool       touchRaw      = false;
 static uint32_t   touchRawMs    = 0;
@@ -1827,19 +1842,13 @@ static void restoreSpeed(){
   cometFast = false;
 }
 static void touchBeep(){ if (gBeepMs) beep(1, gBeepMs); }
-static void touchToggle(){
+static void touchTapPresence(){
   stopDiscoveryBlink(true);
-  if (powerState && currentEffect!=OFF){
-    currentEffect = OFF; powerState = false; setAllPixels(0);
-  } else {
-    currentEffect = (lastOnEffect==OFF) ? PARTY : lastOnEffect;
-    effectPosition = 0; effectDirection = 1;
-    if (currentEffect==PULSE) pulseResetRequested = true;
-    powerState = true;
-    if (!redrawStatic()) setAllPixels(0);
-  }
-  touchBeep();
-  Serial.printf("[TOUCH] tap -> %s\n", getEffectName().c_str());
+  restoreSpeed();
+  const bool toAway = (activePresence() == PRES_AVAILABLE);
+  applyPresence(toAway ? "away" : "available");
+  if (gBeepMs) beep(toAway ? 2 : 1, gBeepMs, 80);   // 1 beep = Available, 2 = Away
+  Serial.printf("[TOUCH] tap -> %s\n", toAway ? "away" : "available");
 }
 static int cycleLen(TouchCycle c){
   switch (c){
@@ -1873,9 +1882,6 @@ static void cycleApply(TouchCycle c, int i){
 }
 static void serviceTouch(){
   const uint32_t now = millis();
-  // Remember the last "on" mode from any source (web, AIO, touch) for tap-to-restore.
-  if (powerState && currentEffect!=OFF) lastOnEffect = currentEffect;
-
   // Debounce: accept a new level only after it has been stable for gTouchDebounceMs.
   const bool raw = (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE);
   if (raw != touchRaw){ touchRaw = raw; touchRawMs = now; }
@@ -1906,7 +1912,7 @@ static void serviceTouch(){
       cycleNextMs += gTouchStepMs;
     }
   } else if (tapCount && (now - touchUpMs) >= gTouchGapMs){
-    if (tapCount == 1) touchToggle();
+    if (tapCount == 1) touchTapPresence();
     else Serial.printf("[TOUCH] %u taps without hold - ignored\n", (unsigned)tapCount);
     tapCount = 0;
   }
