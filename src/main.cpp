@@ -1,6 +1,6 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.10.6-c3
+// Version: 1.10.7-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off (Ring) or Off/Available/Away/Busy
@@ -39,7 +39,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.10.6-c3"
+#define FIRMWARE_VERSION   "1.10.7-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -97,6 +97,11 @@ static uint16_t gLedGap   = DEFAULT_LED_GAP;
 //              Traffic, per-lamp control). Built for 32 LEDs (16 rows).
 enum LedLayout : uint8_t { LAYOUT_RING = 0, LAYOUT_STOPLIGHT = 1 };
 static uint8_t gLayout = LAYOUT_RING;
+// Wi-Fi transmit power (5th field of /hw.txt). Some ESP32-C3 SuperMini boards only
+// associate reliably at reduced power (AUTH_EXPIRE at strong signal otherwise).
+static const wifi_power_t TXPOWER_VALUES[] = { WIFI_POWER_19_5dBm, WIFI_POWER_15dBm, WIFI_POWER_11dBm, WIFI_POWER_8_5dBm };
+static const char* const  TXPOWER_NAMES[]  = { "19.5 dBm (max)", "15 dBm", "11 dBm", "8.5 dBm" };
+static uint8_t gTxPower = 0;   // index into TXPOWER_VALUES
 
 enum LampIdx : uint8_t { LAMP_BOTTOM = 0, LAMP_MIDDLE = 1, LAMP_TOP = 2 };
 static const uint8_t LAMP_ROW0[3] = { 0, 6, 12 };
@@ -310,6 +315,7 @@ static void loadHardwareCfg(){
   gLedCount = DEFAULT_LED_COUNT;
   gLedGap   = DEFAULT_LED_GAP;
   gLayout   = LAYOUT_RING;
+  gTxPower  = 0;
   if (!LittleFS.exists(HW_FILE)) return;
   File f = LittleFS.open(HW_FILE, "r"); if (!f) return;
   String line = f.readStringUntil('\n'); f.close(); line.trim();
@@ -320,8 +326,11 @@ static void loadHardwareCfg(){
   int pin  = line.substring(0,p1).toInt();
   int cnt  = line.substring(p1+1,p2).toInt();
   int gap  = line.substring(p2+1, p3<0 ? line.length() : p3).toInt();
+  int p4 = p3<0 ? -1 : line.indexOf(',', p3+1);   // optional 5th field: TX power index
   int lay  = p3<0 ? LAYOUT_RING : line.substring(p3+1).toInt();
   gLayout = (lay==LAYOUT_STOPLIGHT) ? LAYOUT_STOPLIGHT : LAYOUT_RING;
+  int txp  = p4<0 ? 0 : line.substring(p4+1).toInt();
+  gTxPower = (txp>=0 && txp<4) ? (uint8_t)txp : 0;
   if (pin>=0 && pin<=21) gLedPin = (uint8_t)pin;
   if (cnt>=1 && cnt<=600) gLedCount = (uint16_t)cnt;
   if (gap>=0 && gap<=gLedCount*2) gLedGap = (uint16_t)gap;
@@ -391,7 +400,7 @@ static void saveTouchCfg(){
 }
 static void saveHardwareCfg(){
   File f = LittleFS.open(HW_FILE, "w"); if (!f) return;
-  f.printf("%u,%u,%u,%u\n", (unsigned)gLedPin, (unsigned)gLedCount, (unsigned)gLedGap, (unsigned)gLayout);
+  f.printf("%u,%u,%u,%u,%u\n", (unsigned)gLedPin, (unsigned)gLedCount, (unsigned)gLedGap, (unsigned)gLayout, (unsigned)gTxPower);
   f.close();
 }
  
@@ -714,7 +723,7 @@ static void wlogStartBoot(){
   if (LittleFS.exists(WIFILOG_PREV)) LittleFS.remove(WIFILOG_PREV);
   if (LittleFS.exists(WIFILOG_FILE)) LittleFS.rename(WIFILOG_FILE, WIFILOG_PREV);
   const esp_reset_reason_t r = esp_reset_reason();
-  wlog("Boot: fw %s, reset reason %d = %s", FIRMWARE_VERSION, (int)r, resetReasonStr(r));
+  wlog("Boot: fw %s, reset reason %d = %s, TX power %s", FIRMWARE_VERSION, (int)r, resetReasonStr(r), TXPOWER_NAMES[gTxPower]);
   WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info){
     lastDiscReason = info.wifi_sta_disconnected.reason;
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
@@ -732,11 +741,16 @@ static void rememberCurrentNetwork(){
 }
 // Background scan so the blue bar keeps moving. Returns networks found, or <0 on failure.
 static int scanWithBar(bool showBar, uint32_t ms=10000){
-  WiFi.scanDelete();
-  WiFi.scanNetworks(true);
-  uint32_t s=millis(); int n;
-  while ((n = WiFi.scanComplete()) == WIFI_SCAN_RUNNING && millis()-s<ms){
-    if (showBar) drawProgressBarAndDelay(RGB(0,0,255), s, ms); else delay(50);
+  uint32_t s=millis(); int n = WIFI_SCAN_FAILED;
+  // A scan can't start while the driver is still (re)connecting: retry a few times.
+  for (int attempt=0; attempt<3; ++attempt){
+    WiFi.scanDelete();
+    WiFi.scanNetworks(true);
+    while ((n = WiFi.scanComplete()) == WIFI_SCAN_RUNNING && millis()-s<ms){
+      if (showBar) drawProgressBarAndDelay(RGB(0,0,255), s, ms); else delay(50);
+    }
+    if (n != WIFI_SCAN_FAILED || millis()-s >= ms) break;
+    WiFi.disconnect(); delay(500);
   }
   return n;
 }
@@ -777,6 +791,7 @@ static bool tryKnownNetworks(bool showBar=true, uint32_t msEach=15000, uint32_t 
     else      wlog("[WiFi] Trying \"%s\" (not seen in scan, may be hidden)...", n.ssid.c_str());
     lastDiscReason = 0;
     WiFi.begin(n.ssid.c_str(), n.pass.c_str());
+    WiFi.setTxPower(TXPOWER_VALUES[gTxPower]);   // re-apply: the driver can reset it on start
     uint32_t s=millis();
     while(WiFi.status()!=WL_CONNECTED && millis()-s<ms){
       if (showBar) drawProgressBarAndDelay(RGB(255,128,0), s, ms); else delay(120);
@@ -1566,10 +1581,16 @@ static void handleAdvanced(){
   if (!isStoplight()) out(F(" selected"));
   out(F(">Ring</option><option value='1'"));
   if (isStoplight()) out(F(" selected"));
-  out(F(">Stop light</option></select>"
+  out(F(">Stop light</option></select><div>Wi-Fi TX</div><select name='txpower'>"));
+  for (uint8_t i=0; i<4; ++i){
+    out(F("<option value='")); out(String(i)); out(F("'")); if (i==gTxPower) out(F(" selected"));
+    out(F(">")); out(TXPOWER_NAMES[i]); out(F("</option>"));
+  }
+  out(F("</select>"
         "<button class='btn' type='submit'>Save & Reboot</button></form>"
         "<p style='color:#bbb;margin:8px 0 0 0'>Gap makes circular effects move smoothly over the physical gap (Ring only). "
-        "Stop light: two strips up/down in one strand, Count 32.</p>"));
+        "Stop light: two strips up/down in one strand, Count 32. "
+        "Wi-Fi TX: lower it if the Wi-Fi Boot Log shows reason 2 (AUTH_EXPIRE) at strong signal.</p>"));
   if (isStoplight() && gLedCount != 32)
     out(F("<p style='color:#F44336;margin:6px 0 0 0'>Stop light layout expects Count 32.</p>"));
   cardEnd();
@@ -1873,6 +1894,7 @@ static void handleSaveHardware(){
   gLedCount = (uint16_t)count;
   gLedGap   = (uint16_t)gap;
   if (server.hasArg("layout")) gLayout = (server.arg("layout").toInt()==LAYOUT_STOPLIGHT) ? LAYOUT_STOPLIGHT : LAYOUT_RING;
+  if (server.hasArg("txpower")){ int t = server.arg("txpower").toInt(); gTxPower = (t>=0 && t<4) ? (uint8_t)t : 0; }
   saveHardwareCfg();
   server.send(200,"text/plain","Saved. Rebooting to apply…");
   delay(300); ESP.restart();
@@ -2108,6 +2130,7 @@ void setup(){
   wifiSetAutoConnect(!forgetOnce);
   WiFi.setAutoReconnect(!forgetOnce);
   WiFi.setSleep(false);
+  WiFi.setTxPower(TXPOWER_VALUES[gTxPower]);
  
   if (forgetOnce) startConfigPortalOnly(); else connectWithFallbacks();
   effectDelay = speedToDelay(50);
