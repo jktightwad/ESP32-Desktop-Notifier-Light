@@ -1,6 +1,6 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.10.5-c3
+// Version: 1.10.6-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off (Ring) or Off/Available/Away/Busy
@@ -33,11 +33,13 @@
 #include <algorithm>
 #include <esp_wifi.h>
 #include <esp_timer.h>
+#include <esp_system.h>
+#include <stdarg.h>
 #include <secrets.h>
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.10.5-c3"
+#define FIRMWARE_VERSION   "1.10.6-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -75,6 +77,8 @@ static const char* FORGET_FILE     = "/forget.flag";      // one-shot: force por
 static const char* OTAONLY_FILE    = "/otaonly.flag";     // recovery flag
 static const char* HW_FILE         = "/hw.txt";           // "pin,count,gap"
 static const char* STOPLIGHT_FILE  = "/stoplight.txt";   // "bot,mid,top colours (hex),green,yellow,red ms"
+static const char* WIFILOG_FILE    = "/wifilog.txt";      // this boot's Wi-Fi connect log
+static const char* WIFILOG_PREV    = "/wifilog_prev.txt"; // previous boot's (kept across one reset)
 static const char* TOUCH_FILE      = "/touch.txt";        // "v2,debounce,gap,hold,step,beep,active"
 static const char* LASTMSG_FILE    = "/lastmsg.json";     // persists last AIO message
 static const char* ROSTER_FILE     = "/roster.json";      // check-in roster (known devices)
@@ -681,6 +685,40 @@ static std::vector<WifiCred> knownNetworks(){
   return v;
 }
 // The network the ESP32 saved itself (earlier firmware or the portal), copied into the list.
+// ---------------------- Wi-Fi boot log --------------------------------
+// Deployed units have no serial console: each boot's connect attempt is written to
+// flash and shown on /advanced, along with the previous boot's.
+static volatile uint8_t lastDiscReason = 0;   // from the Wi-Fi driver's disconnect event
+static void wlog(const char* fmt, ...){
+  char buf[160];
+  va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+  Serial.println(buf);
+  File f = LittleFS.open(WIFILOG_FILE, "a");   // capped: loop() retries during long outages
+  if (f){ if (f.size() < 4096) f.printf("%7.1fs  %s\n", millis() / 1000.0, buf); f.close(); }
+}
+static const char* resetReasonStr(esp_reset_reason_t r){
+  switch (r){
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external reset pin";
+    case ESP_RST_SW:        return "software restart (reboot / OTA)";
+    case ESP_RST_PANIC:     return "crash (panic)";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_BROWNOUT:  return "brownout (supply dipped)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    default:                return "other";
+  }
+}
+static void wlogStartBoot(){
+  if (LittleFS.exists(WIFILOG_PREV)) LittleFS.remove(WIFILOG_PREV);
+  if (LittleFS.exists(WIFILOG_FILE)) LittleFS.rename(WIFILOG_FILE, WIFILOG_PREV);
+  const esp_reset_reason_t r = esp_reset_reason();
+  wlog("Boot: fw %s, reset reason %d = %s", FIRMWARE_VERSION, (int)r, resetReasonStr(r));
+  WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info){
+    lastDiscReason = info.wifi_sta_disconnected.reason;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+}
 static void importEspSavedNetwork(){
   wifi_config_t conf;
   if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return;
@@ -707,16 +745,17 @@ static int scanWithBar(bool showBar, uint32_t ms=10000){
 // joining each one. showBar=false leaves the current effect alone (used from loop()).
 static bool tryKnownNetworks(bool showBar=true, uint32_t msEach=15000, uint32_t msUnseen=8000){
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[WiFi] Already connected: %s | IP:%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    wlog("[WiFi] Already connected: %s | IP:%s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     rememberCurrentNetwork(); return true;
   }
   std::vector<WifiCred> known = knownNetworks();
-  if (known.empty()){ Serial.println("[WiFi] No known networks."); return false; }
+  if (known.empty()){ wlog("[WiFi] No known networks."); return false; }
   if (showBar) statusActive = true;
-  Serial.printf("[WiFi] Scanning for %u known network(s)...\n", (unsigned)known.size());
+  wlog("[WiFi] Scanning for %u known network(s)...", (unsigned)known.size());
   WiFi.disconnect();   // stop any auto-connect attempt so the scan can run
   int found = scanWithBar(showBar);
-  if (found < 0) Serial.println("[WiFi] Scan failed.");
+  if (found < 0) wlog("[WiFi] Scan failed (%d).", found);
+  else            wlog("[WiFi] Scan found %d network(s).", found);
 
   const int UNSEEN = -1000;
   struct Candidate { size_t idx; int rssi; };
@@ -734,20 +773,21 @@ static bool tryKnownNetworks(bool showBar=true, uint32_t msEach=15000, uint32_t 
     const WifiCred& n = known[c.idx];
     const bool seen = c.rssi != UNSEEN;
     const uint32_t ms = seen ? msEach : msUnseen;
-    if (seen) Serial.printf("[WiFi] Trying \"%s\" (%d dBm)...\n", n.ssid.c_str(), c.rssi);
-    else      Serial.printf("[WiFi] Trying \"%s\" (not seen in scan, may be hidden)...\n", n.ssid.c_str());
+    if (seen) wlog("[WiFi] Trying \"%s\" (%d dBm)...", n.ssid.c_str(), c.rssi);
+    else      wlog("[WiFi] Trying \"%s\" (not seen in scan, may be hidden)...", n.ssid.c_str());
+    lastDiscReason = 0;
     WiFi.begin(n.ssid.c_str(), n.pass.c_str());
     uint32_t s=millis();
     while(WiFi.status()!=WL_CONNECTED && millis()-s<ms){
       if (showBar) drawProgressBarAndDelay(RGB(255,128,0), s, ms); else delay(120);
     }
     if (WiFi.status()==WL_CONNECTED){
-      Serial.printf("[WiFi] Connected: %s | IP:%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+      wlog("[WiFi] Connected: %s | IP:%s after %lums", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), (unsigned long)(millis()-s));
       rememberCurrentNetwork();
       if (showBar){ setAllPixels(0); statusActive = false; }
       return true;
     }
-    Serial.printf("[WiFi] \"%s\" failed.\n", n.ssid.c_str());
+    wlog("[WiFi] \"%s\" failed: status %d, last disconnect reason %u", n.ssid.c_str(), (int)WiFi.status(), (unsigned)lastDiscReason);
     WiFi.disconnect();
   }
   if (showBar){ setAllPixels(0); statusActive = false; }
@@ -775,19 +815,25 @@ static void afterConnectAnnounce(){ startEphemeralAPWithStaIP(60000); }
 static void connectWithFallbacks(){
   importEspSavedNetwork();
   if (tryKnownNetworks()){ afterConnectAnnounce(); return; }
+  // One more pass before the portal: a second reset used to fix a failed first boot.
+  if (!knownNetworks().empty()){
+    wlog("[WiFi] No known network joined - second pass");
+    WiFi.disconnect(); delay(500);
+    if (tryKnownNetworks()){ afterConnectAnnounce(); return; }
+  }
   WiFi.softAPdisconnect(true); apRunning = false;
-  Serial.println("[WiFi] Launching Config Portal (OPEN, WiFiManager)...");
+  wlog("[WiFi] Launching Config Portal (OPEN, WiFiManager)...");
   wm.setConfigPortalTimeout(300);
   wm.setAPCallback([](WiFiManager *){ showPortalStaticPurple(true); });
   bool ok = wm.startConfigPortal("OnAirLight-Setup");
   showPortalStaticPurple(false);
   if (ok){
     setAllPixels(RGB(0,255,0)); delay(120); setAllPixels(0);
-    Serial.printf("[WiFi] Connected via portal. SSID=%s IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    wlog("[WiFi] Connected via portal. SSID=%s IP=%s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     rememberCurrentNetwork();
     afterConnectAnnounce();
   } else {
-    Serial.println("[WiFi] Portal timeout.");
+    wlog("[WiFi] Portal timeout.");
   }
 }
 static void startConfigPortalOnly(){
@@ -801,11 +847,11 @@ static void startConfigPortalOnly(){
   showPortalStaticPurple(false);
   if (ok){
     setAllPixels(RGB(0,255,0)); delay(120); setAllPixels(0);
-    Serial.printf("[WiFi] Connected via portal. SSID=%s IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    wlog("[WiFi] Connected via portal. SSID=%s IP=%s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     rememberCurrentNetwork();
     afterConnectAnnounce();
   } else {
-    Serial.println("[WiFi] Portal timeout.");
+    wlog("[WiFi] Portal timeout.");
   }
 }
  
@@ -1599,6 +1645,21 @@ static void handleAdvanced(){
   cardEnd();
  
   // Last AIO Message
+  // Wi-Fi connect log: this boot and the previous one
+  cardStart(F("Wi-Fi Boot Log"));
+  out(F("<p style='color:#bbb;margin:0 0 6px 0'>Disconnect reason codes are ESP-IDF wifi_err_reason_t values "
+        "(e.g. 201 = network not found, 15 = 4-way handshake timeout, often a wrong password or weak signal).</p>"));
+  const char* const LOGS[2]   = { WIFILOG_FILE, WIFILOG_PREV };
+  const char* const TITLES[2] = { "This boot", "Previous boot" };
+  for (int k=0; k<2; ++k){
+    out(F("<div class='kv'><b>")); out(TITLES[k]); out(F("</b></div><pre style='white-space:pre-wrap;font-size:12px;background:#222;padding:8px;border-radius:6px;margin:0 0 8px 0'>"));
+    File f = LittleFS.open(LOGS[k], "r");
+    if (!f) out(F("(none)"));
+    else { while (f.available()) out(htmlEsc(f.readStringUntil('\n')) + "\n"); f.close(); }
+    out(F("</pre>"));
+  }
+  cardEnd();
+
   cardStart(F("Last AIO Message"));
   out(F("<div class='kv'><b>Topic:</b> ")); out(lastMsgTopic);
   out(F("</div><div class='kv'><b>When:</b> "));
@@ -2016,6 +2077,7 @@ void setup(){
   Serial.println("\n[BOOT] On Air Light v" FIRMWARE_VERSION " (ESP32-C3)");
  
   if (LittleFS.begin(true)){
+    wlogStartBoot();
     loadConfig();
     loadAIODevice();
     loadGroups();
