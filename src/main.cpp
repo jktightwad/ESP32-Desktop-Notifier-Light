@@ -1,6 +1,6 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.10.4-c3
+// Version: 1.10.5-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off (Ring) or Off/Available/Away/Busy
@@ -37,7 +37,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.10.4-c3"
+#define FIRMWARE_VERSION   "1.10.5-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -118,6 +118,11 @@ static uint16_t gBeepMs          = DEFAULT_BEEP_MS;
 // Module output level while touched. TTP223 boards default to HIGH; a solder
 // jumper on some boards inverts it (signal HIGH at rest, LOW when touched).
 static bool     gTouchActiveHigh = true;
+// Recent touch edges for the diagnostics on /advanced (devices run without a PC).
+struct TouchEvt { uint32_t ms; bool down; bool pinHigh; };
+#define TOUCH_LOG_N 10
+static TouchEvt touchLog[TOUCH_LOG_N];
+static uint8_t  touchLogLen = 0, touchLogHead = 0;   // head = next slot to write
  
 Adafruit_NeoPixel strip(DEFAULT_LED_COUNT, DEFAULT_LED_PIN, NEO_GRB + NEO_KHZ800);
 WebServer server(80);
@@ -1570,6 +1575,27 @@ static void handleAdvanced(){
         "Step: time per item while holding. Beep 0 = silent. "
         "Active level: Low if the module's LED is lit when not touched. "
         "Applies immediately, no reboot.</p>"));
+
+  // Diagnostics: live pin level (polled by the page) + recent edges
+  out(F("<div class='kv' style='margin-top:12px'><b>Sensor now:</b> <span id='tpin'>&hellip;</span></div>"
+        "<div class='kv'><b>Recent touches</b> (newest first, as of page load):</div>"));
+  if (!touchLogLen) out(F("<em>None since boot.</em>"));
+  else {
+    out(F("<table style='font-size:14px;border-collapse:collapse'>"
+          "<tr style='text-align:left'><th style='padding-right:16px'>When</th><th style='padding-right:16px'>Edge</th><th>Pin</th></tr>"));
+    for (uint8_t k=0; k<touchLogLen; ++k){
+      const TouchEvt& e = touchLog[(touchLogHead + TOUCH_LOG_N - 1 - k) % TOUCH_LOG_N];
+      out(F("<tr><td style='padding-right:16px'>")); out(agoStr(millis() - e.ms)); out(F(" ago"));
+      out(F("</td><td style='padding-right:16px'>")); out(e.down ? F("down (touched)") : F("up (released)"));
+      out(F("</td><td>")); out(e.pinHigh ? F("HIGH") : F("LOW")); out(F("</td></tr>"));
+    }
+    out(F("</table>"));
+  }
+  out(F("<script>(function(){var el=document.getElementById('tpin');"
+        "function t(){fetch('/touchstate',{cache:'no-store'}).then(function(r){return r.json();})"
+        ".then(function(j){el.textContent='pin '+(j.pin?'HIGH':'LOW')+' = '+(j.touched?'TOUCHED':'not touched')"
+        "+' (active '+(j.activeHigh?'High':'Low')+')';el.style.color=j.touched?'#28a745':'#bbb';})"
+        ".catch(function(){el.textContent='(no response)';});}t();setInterval(t,500);})();</script>"));
   cardEnd();
  
   // Last AIO Message
@@ -1719,6 +1745,15 @@ static void handleRosterClear(){
   server.sendHeader("Location","/"); server.send(302);
 }
 static void touchPinInit();   // touch section, below
+// Live sensor level for the Advanced page diagnostics.
+static void handleTouchState(){
+  const bool pinHigh = digitalRead(TOUCH_PIN) == HIGH;
+  String j = String("{\"pin\":") + (pinHigh ? "1" : "0") +
+             ",\"touched\":" + ((pinHigh == gTouchActiveHigh) ? "true" : "false") +
+             ",\"activeHigh\":" + (gTouchActiveHigh ? "true" : "false") + "}";
+  server.sendHeader("Cache-Control","no-store");
+  server.send(200, "application/json", j);
+}
 static void handleSaveTouch(){
   if (server.hasArg("defaults")){
     setTouchCfg(DEFAULT_TOUCH_DEBOUNCE_MS, DEFAULT_TOUCH_GAP_MS, DEFAULT_TOUCH_HOLD_MS,
@@ -1936,7 +1971,11 @@ static void serviceTouch(){
   if (raw != touchRaw){ touchRaw = raw; touchRawMs = now; }
   if (raw != touchStable && (now - touchRawMs) >= gTouchDebounceMs){
     touchStable = raw;
-    Serial.printf("[TOUCH] %s (pin %s)\n", touchStable ? "down" : "up", digitalRead(TOUCH_PIN) ? "HIGH" : "LOW");
+    const bool pinHigh = digitalRead(TOUCH_PIN) == HIGH;
+    Serial.printf("[TOUCH] %s (pin %s)\n", touchStable ? "down" : "up", pinHigh ? "HIGH" : "LOW");
+    touchLog[touchLogHead] = { now, touchStable, pinHigh };
+    touchLogHead = (touchLogHead + 1) % TOUCH_LOG_N;
+    if (touchLogLen < TOUCH_LOG_N) ++touchLogLen;
     if (touchStable){
       touchDownMs = now;
     } else if (touchCycle != TC_NONE){            // release ends a cycle: keep it
@@ -2037,6 +2076,7 @@ void setup(){
   server.on("/otarecovery", handleOtaRecovery);
   server.on("/save_hw", handleSaveHardware);
   server.on("/save_touch", handleSaveTouch);
+  server.on("/touchstate", handleTouchState);
   server.on("/lamps", handleLamps);
   server.on("/save_stoplight", handleSaveStoplight);
   server.on("/poll", handlePollNow);
