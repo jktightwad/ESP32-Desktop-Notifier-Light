@@ -1,11 +1,11 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.10.2-c3
+// Version: 1.10.3-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off (Ring) or Off/Available/Away/Busy
 //    (Stop light); 1/2/3 taps + hold = cycle
-//    fun modes / presence / fast comet colours, release keeps
+//    fun modes / presence / colour, release keeps
 //  - Touch/buzzer timings editable on /advanced (saved to /touch.txt)
 //  - TDB05LFPN buzzer on GPIO7: touch feedback + AIO "beep" (count, {count,on,off}, or [ms,...])
 //  - AIO "poll": devices post "onair-pong" to group "checkin"; devices in that
@@ -37,7 +37,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.10.2-c3"
+#define FIRMWARE_VERSION   "1.10.3-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -52,7 +52,6 @@
 #define DEFAULT_TOUCH_GAP_MS       400    // max gap between taps of one gesture
 #define DEFAULT_TOUCH_HOLD_MS      600    // after 1-3 taps, holding this long starts a cycle
 #define DEFAULT_TOUCH_STEP_MS      1000   // cycle: time per mode
-#define DEFAULT_COMET_FAST_SPEED   85     // UI speed (0-100) for the 3-tap colour comet
 
 // TDB05LFPN magnetic buzzer (5V / ~30mA) on GPIO7 via NPN transistor (not direct).
 // Bench-tested: steady tone on plain 5V DC = built-in oscillator, so drive it on/off.
@@ -77,7 +76,7 @@ static const char* FORGET_FILE     = "/forget.flag";      // one-shot: force por
 static const char* OTAONLY_FILE    = "/otaonly.flag";     // recovery flag
 static const char* HW_FILE         = "/hw.txt";           // "pin,count,gap"
 static const char* STOPLIGHT_FILE  = "/stoplight.txt";   // "bot,mid,top colours (hex),green,yellow,red ms"
-static const char* TOUCH_FILE      = "/touch.txt";        // "debounce,gap,hold,step,comet,beep"
+static const char* TOUCH_FILE      = "/touch.txt";        // "debounce,gap,hold,step,beep"
 static const char* LASTMSG_FILE    = "/lastmsg.json";     // persists last AIO message
 static const char* ROSTER_FILE     = "/roster.json";      // check-in roster (known devices)
  
@@ -116,7 +115,6 @@ static uint16_t gTouchDebounceMs = DEFAULT_TOUCH_DEBOUNCE_MS;
 static uint16_t gTouchGapMs      = DEFAULT_TOUCH_GAP_MS;
 static uint16_t gTouchHoldMs     = DEFAULT_TOUCH_HOLD_MS;
 static uint16_t gTouchStepMs     = DEFAULT_TOUCH_STEP_MS;
-static uint8_t  gCometFastSpeed  = DEFAULT_COMET_FAST_SPEED;   // 0-100
 static uint16_t gBeepMs          = DEFAULT_BEEP_MS;
  
 Adafruit_NeoPixel strip(DEFAULT_LED_COUNT, DEFAULT_LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -345,14 +343,13 @@ static void saveStoplightCfg(){
     (unsigned long)gTrafficMs[0], (unsigned long)gTrafficMs[1], (unsigned long)gTrafficMs[2]);
   f.close();
 }
-// Touch cfg: "debounce,gap,hold,step,comet,beep". Values are clamped to the UI ranges
+// Touch cfg: "debounce,gap,hold,step,beep". Values are clamped to the UI ranges
 // (as long, before narrowing, so out-of-range input can't wrap).
-static void setTouchCfg(long debounce, long gap, long hold, long step, long comet, long beepMs){
+static void setTouchCfg(long debounce, long gap, long hold, long step, long beepMs){
   gTouchDebounceMs = (uint16_t)constrain(debounce, 5L, 200L);
   gTouchGapMs      = (uint16_t)constrain(gap, 150L, 1500L);
   gTouchHoldMs     = (uint16_t)constrain(hold, 200L, 3000L);
   gTouchStepMs     = (uint16_t)constrain(step, 200L, 5000L);
-  gCometFastSpeed  = (uint8_t) constrain(comet, 0L, 100L);
   gBeepMs          = (uint16_t)constrain(beepMs, 0L, 500L);
 }
 static void loadTouchCfg(){
@@ -366,13 +363,14 @@ static void loadTouchCfg(){
     if (c < 0) break;
     from = c + 1;
   }
-  if (n != 6) return;   // malformed: keep defaults
-  setTouchCfg(v[0], v[1], v[2], v[3], v[4], v[5]);
+  // 5 fields; files from 1.8.8-1.10.2 have a 6th (old comet speed) before beep.
+  if (n == 5)      setTouchCfg(v[0], v[1], v[2], v[3], v[4]);
+  else if (n == 6) setTouchCfg(v[0], v[1], v[2], v[3], v[5]);
 }
 static void saveTouchCfg(){
   File f = LittleFS.open(TOUCH_FILE, "w"); if (!f) return;
-  f.printf("%u,%u,%u,%u,%u,%u\n", (unsigned)gTouchDebounceMs, (unsigned)gTouchGapMs, (unsigned)gTouchHoldMs,
-           (unsigned)gTouchStepMs, (unsigned)gCometFastSpeed, (unsigned)gBeepMs);
+  f.printf("%u,%u,%u,%u,%u\n", (unsigned)gTouchDebounceMs, (unsigned)gTouchGapMs, (unsigned)gTouchHoldMs,
+           (unsigned)gTouchStepMs, (unsigned)gBeepMs);
   f.close();
 }
 static void saveHardwareCfg(){
@@ -1549,8 +1547,6 @@ static void handleAdvanced(){
   out(String(gTouchHoldMs));
   out(F("'><div>Step ms</div><input type='number' name='step' min='200' max='5000' value='"));
   out(String(gTouchStepMs));
-  out(F("'><div>Comet speed</div><input type='number' name='comet' min='0' max='100' value='"));
-  out(String(gCometFastSpeed));
   out(F("'><div>Beep ms</div><input type='number' name='beep' min='0' max='500' value='"));
   out(String(gBeepMs));
   out(F("'>"
@@ -1558,9 +1554,9 @@ static void handleAdvanced(){
         "<a class='btn sm' href='/save_touch?defaults=1'>Defaults</a>"
         "<p style='color:#bbb;margin:8px 0 0 0'>"
         "Tap: Ring = on/off; Stop light = Off / Available / Away / Busy. "
-        "1, 2 or 3 taps then hold = cycle modes / presence / fast comet colours.<br>"
+        "1, 2 or 3 taps then hold = cycle modes / presence / colour (for Solid, Blink, Breathe, Comet, Pulse, Knight Rider).<br>"
         "Tap gap: max pause between taps. Hold: press length that starts a cycle. "
-        "Step: time per mode while holding. Comet speed: 0-100. Beep 0 = silent. "
+        "Step: time per item while holding. Beep 0 = silent. "
         "Applies immediately, no reboot.</p>"));
   cardEnd();
  
@@ -1713,17 +1709,17 @@ static void handleRosterClear(){
 static void handleSaveTouch(){
   if (server.hasArg("defaults")){
     setTouchCfg(DEFAULT_TOUCH_DEBOUNCE_MS, DEFAULT_TOUCH_GAP_MS, DEFAULT_TOUCH_HOLD_MS,
-                DEFAULT_TOUCH_STEP_MS, DEFAULT_COMET_FAST_SPEED, DEFAULT_BEEP_MS);
+                DEFAULT_TOUCH_STEP_MS, DEFAULT_BEEP_MS);
   } else {
     // Missing fields keep their current value.
     auto arg = [](const char* k, long cur){ return server.hasArg(k) ? server.arg(k).toInt() : cur; };
     setTouchCfg(arg("debounce", gTouchDebounceMs), arg("gap", gTouchGapMs), arg("hold", gTouchHoldMs),
-                arg("step", gTouchStepMs), arg("comet", gCometFastSpeed), arg("beep", gBeepMs));
+                arg("step", gTouchStepMs), arg("beep", gBeepMs));
   }
   saveTouchCfg();
-  Serial.printf("[TOUCH] cfg debounce=%u gap=%u hold=%u step=%u comet=%u beep=%u\n",
+  Serial.printf("[TOUCH] cfg debounce=%u gap=%u hold=%u step=%u beep=%u\n",
     (unsigned)gTouchDebounceMs, (unsigned)gTouchGapMs, (unsigned)gTouchHoldMs,
-    (unsigned)gTouchStepMs, (unsigned)gCometFastSpeed, (unsigned)gBeepMs);
+    (unsigned)gTouchStepMs, (unsigned)gBeepMs);
   server.sendHeader("Location","/advanced"); server.send(302);
 }
 static uint32_t hexArg(const char* k, uint32_t cur){
@@ -1818,14 +1814,15 @@ static void beep(uint8_t count, uint16_t onMs, uint16_t offMs){
 //                                       (from any other mode: Off)
 //   1 tap, then hold                 -> cycle fun modes
 //   2 taps, then hold                -> cycle presence: Available / Busy / Away
-//   3 taps, then hold                -> fast comet cycling R/G/B/Y/C/M/White
+//   3 taps, then hold                -> pick the colour (R/G/B/Y/C/M/White) used by
+//                                       Solid, Blink, Breathe, Comet, Pulse, Knight Rider
 // While holding, the light switches to the next item every gTouchStepMs;
 // releasing keeps the one showing (confirm beep). Other tap counts are ignored.
-enum TouchCycle : uint8_t { TC_NONE, TC_FUN, TC_PRESENCE, TC_COMET };
+enum TouchCycle : uint8_t { TC_NONE, TC_FUN, TC_PRESENCE, TC_COLOR };
 
 static const effect      FUN_EFFECTS[]  = { SOLID, BLINK, PARTY, KNIGHT_RIDER, BREATHE, COMET, RAINBOW, PULSE, TRAFFIC };
 static const char* const PRESENCE[]     = { "available", "busy", "away" };
-static const uint32_t    COMET_COLORS[] = { 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF };
+static const uint32_t    COLOR_CYCLE[]  = { 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF };
 #define ARRAY_LEN(a) (int)(sizeof(a)/sizeof((a)[0]))
 
 static effect     lastOnEffect  = OFF;     // OFF = no mode used yet since boot (Ring tap)
@@ -1838,13 +1835,10 @@ static uint8_t    tapCount      = 0;       // completed taps in the current gest
 static TouchCycle touchCycle    = TC_NONE;
 static int        cycleIdx      = 0;
 static uint32_t   cycleNextMs   = 0;
-static bool          cometFast  = false;   // effectDelay currently overridden by the 3-tap comet
-static unsigned long savedDelay = 0, cometDelay = 0;
 
-static void restoreSpeed(){
-  // Undo the fast-comet speed unless something else (web/AIO) changed it since.
-  if (cometFast && effectDelay == cometDelay) effectDelay = savedDelay;
-  cometFast = false;
+// Modes that draw with the shared colour (currentColor).
+static bool usesColor(effect e){
+  return e==SOLID || e==BLINK || e==BREATHE || e==COMET || e==PULSE || e==KNIGHT_RIDER;
 }
 static void touchBeep(){ if (gBeepMs) beep(1, gBeepMs); }
 // Ring: on/off.
@@ -1866,7 +1860,6 @@ static void touchToggle(){
 // Available = 1, Away = 2, Busy = 3.
 static void touchTapStoplight(){
   stopDiscoveryBlink(true);
-  restoreSpeed();
   const bool isOff = !powerState || currentEffect==OFF;
   const int8_t p = activePresence();
   const char* next;
@@ -1887,7 +1880,7 @@ static int cycleLen(TouchCycle c){
   switch (c){
     case TC_FUN:      return ARRAY_LEN(FUN_EFFECTS);
     case TC_PRESENCE: return ARRAY_LEN(PRESENCE);
-    case TC_COMET:    return ARRAY_LEN(COMET_COLORS);
+    case TC_COLOR:    return ARRAY_LEN(COLOR_CYCLE);
     default:          return 1;
   }
 }
@@ -1895,22 +1888,20 @@ static int cycleLen(TouchCycle c){
 static void cycleApply(TouchCycle c, int i){
   stopDiscoveryBlink(true);
   if (c==TC_FUN){
-    restoreSpeed();
     currentEffect = FUN_EFFECTS[i];
     effectPosition = 0; effectDirection = 1;
     if (currentEffect==PULSE) pulseResetRequested = true;
     powerState = true;
     if (!redrawStatic()) setAllPixels(0);
   } else if (c==TC_PRESENCE){
-    restoreSpeed();
     applyPresence(PRESENCE[i]);
-  } else if (c==TC_COMET){
-    if (!cometFast){ savedDelay = effectDelay; cometFast = true; }
-    effectDelay = cometDelay = speedToDelay(gCometFastSpeed);
-    const uint32_t col = COMET_COLORS[i];
+  } else if (c==TC_COLOR){
+    const uint32_t col = COLOR_CYCLE[i];
     applyColorPreserveBrightness((col>>16)&0xFF, (col>>8)&0xFF, col&0xFF);
-    if (currentEffect!=COMET || !powerState) setAllPixels(0);
-    currentEffect = COMET; powerState = true;
+    // Keep a colour mode running so it shows the new colour; otherwise preview as Solid.
+    if (!powerState || !usesColor(currentEffect)){ currentEffect = SOLID; powerState = true; }
+    if (currentEffect==SOLID) setAllPixels(currentColor);
+    if (currentEffect==PULSE) pulseResetRequested = true;
   }
 }
 static void serviceTouch(){
@@ -1937,7 +1928,7 @@ static void serviceTouch(){
   if (touchStable){
     const uint32_t held = now - touchDownMs;
     if (touchCycle == TC_NONE && tapCount >= 1 && tapCount <= 3 && held >= gTouchHoldMs){
-      touchCycle = (TouchCycle)tapCount;           // 1 = fun, 2 = presence, 3 = comet
+      touchCycle = (TouchCycle)tapCount;           // 1 = fun, 2 = presence, 3 = colour
       cycleIdx = 0;
       cycleApply(touchCycle, cycleIdx);
       cycleNextMs = now + gTouchStepMs;
