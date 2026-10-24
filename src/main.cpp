@@ -1,6 +1,6 @@
 // =====================================================================
 // On Air Light (ESP32-C3)
-// Version: 1.10.3-c3
+// Version: 1.10.4-c3
 //  - Split UI:  "/" (simple)  +  "/advanced" (heavy cards)
 //  - Both pages stream in chunks (low RAM, fast clicks)
 //  - HW-139 touch on GPIO10: tap = on/off (Ring) or Off/Available/Away/Busy
@@ -37,7 +37,7 @@
 #include "wifi_store.h"
 
 // ---------------------- Firmware & Defaults ---------------------------
-#define FIRMWARE_VERSION   "1.10.3-c3"
+#define FIRMWARE_VERSION   "1.10.4-c3"
 #define DEFAULT_LED_PIN    3
 #define DEFAULT_LED_COUNT  18
 #define DEFAULT_LED_GAP    0          // virtual gap length for ring animations
@@ -46,7 +46,6 @@
 // GPIO10 avoids the C3 strapping pins (2/8/9) and the UART0 pins (20/21).
 // Module default (jumpers open) = momentary, HIGH while touched.
 #define TOUCH_PIN          10
-#define TOUCH_ACTIVE       HIGH
 // Defaults for the touch settings (editable on /advanced, saved in /touch.txt)
 #define DEFAULT_TOUCH_DEBOUNCE_MS  30     // ignore edges shorter than this
 #define DEFAULT_TOUCH_GAP_MS       400    // max gap between taps of one gesture
@@ -76,7 +75,7 @@ static const char* FORGET_FILE     = "/forget.flag";      // one-shot: force por
 static const char* OTAONLY_FILE    = "/otaonly.flag";     // recovery flag
 static const char* HW_FILE         = "/hw.txt";           // "pin,count,gap"
 static const char* STOPLIGHT_FILE  = "/stoplight.txt";   // "bot,mid,top colours (hex),green,yellow,red ms"
-static const char* TOUCH_FILE      = "/touch.txt";        // "debounce,gap,hold,step,beep"
+static const char* TOUCH_FILE      = "/touch.txt";        // "v2,debounce,gap,hold,step,beep,active"
 static const char* LASTMSG_FILE    = "/lastmsg.json";     // persists last AIO message
 static const char* ROSTER_FILE     = "/roster.json";      // check-in roster (known devices)
  
@@ -116,6 +115,9 @@ static uint16_t gTouchGapMs      = DEFAULT_TOUCH_GAP_MS;
 static uint16_t gTouchHoldMs     = DEFAULT_TOUCH_HOLD_MS;
 static uint16_t gTouchStepMs     = DEFAULT_TOUCH_STEP_MS;
 static uint16_t gBeepMs          = DEFAULT_BEEP_MS;
+// Module output level while touched. TTP223 boards default to HIGH; a solder
+// jumper on some boards inverts it (signal HIGH at rest, LOW when touched).
+static bool     gTouchActiveHigh = true;
  
 Adafruit_NeoPixel strip(DEFAULT_LED_COUNT, DEFAULT_LED_PIN, NEO_GRB + NEO_KHZ800);
 WebServer server(80);
@@ -345,7 +347,8 @@ static void saveStoplightCfg(){
 }
 // Touch cfg: "debounce,gap,hold,step,beep". Values are clamped to the UI ranges
 // (as long, before narrowing, so out-of-range input can't wrap).
-static void setTouchCfg(long debounce, long gap, long hold, long step, long beepMs){
+static void setTouchCfg(long debounce, long gap, long hold, long step, long beepMs, bool activeHigh){
+  gTouchActiveHigh = activeHigh;
   gTouchDebounceMs = (uint16_t)constrain(debounce, 5L, 200L);
   gTouchGapMs      = (uint16_t)constrain(gap, 150L, 1500L);
   gTouchHoldMs     = (uint16_t)constrain(hold, 200L, 3000L);
@@ -356,6 +359,9 @@ static void loadTouchCfg(){
   if (!LittleFS.exists(TOUCH_FILE)) return;
   File f = LittleFS.open(TOUCH_FILE, "r"); if (!f) return;
   String line = f.readStringUntil('\n'); f.close(); line.trim();
+  // Current: "v2,debounce,gap,hold,step,beep,active(1=high)". Older files have no prefix.
+  const bool v2 = line.startsWith("v2,");
+  if (v2) line.remove(0, 3);
   long v[6]; int n = 0, from = 0;
   while (n < 6){
     int c = line.indexOf(',', from);
@@ -363,14 +369,15 @@ static void loadTouchCfg(){
     if (c < 0) break;
     from = c + 1;
   }
-  // 5 fields; files from 1.8.8-1.10.2 have a 6th (old comet speed) before beep.
-  if (n == 5)      setTouchCfg(v[0], v[1], v[2], v[3], v[4]);
-  else if (n == 6) setTouchCfg(v[0], v[1], v[2], v[3], v[5]);
+  if (v2){ if (n == 6) setTouchCfg(v[0], v[1], v[2], v[3], v[4], v[5] != 0); return; }
+  // Legacy: 5 fields (1.10.3), or 6 with the old comet speed before beep (1.8.8-1.10.2).
+  if (n == 5)      setTouchCfg(v[0], v[1], v[2], v[3], v[4], true);
+  else if (n == 6) setTouchCfg(v[0], v[1], v[2], v[3], v[5], true);
 }
 static void saveTouchCfg(){
   File f = LittleFS.open(TOUCH_FILE, "w"); if (!f) return;
-  f.printf("%u,%u,%u,%u,%u\n", (unsigned)gTouchDebounceMs, (unsigned)gTouchGapMs, (unsigned)gTouchHoldMs,
-           (unsigned)gTouchStepMs, (unsigned)gBeepMs);
+  f.printf("v2,%u,%u,%u,%u,%u,%u\n", (unsigned)gTouchDebounceMs, (unsigned)gTouchGapMs, (unsigned)gTouchHoldMs,
+           (unsigned)gTouchStepMs, (unsigned)gBeepMs, gTouchActiveHigh ? 1u : 0u);
   f.close();
 }
 static void saveHardwareCfg(){
@@ -1549,7 +1556,11 @@ static void handleAdvanced(){
   out(String(gTouchStepMs));
   out(F("'><div>Beep ms</div><input type='number' name='beep' min='0' max='500' value='"));
   out(String(gBeepMs));
-  out(F("'>"
+  out(F("'><div>Active level</div><select name='active'><option value='1'"));
+  if (gTouchActiveHigh) out(F(" selected"));
+  out(F(">High (default)</option><option value='0'"));
+  if (!gTouchActiveHigh) out(F(" selected"));
+  out(F(">Low</option></select>"
         "<button class='btn' type='submit'>Save</button></form>"
         "<a class='btn sm' href='/save_touch?defaults=1'>Defaults</a>"
         "<p style='color:#bbb;margin:8px 0 0 0'>"
@@ -1557,6 +1568,7 @@ static void handleAdvanced(){
         "1, 2 or 3 taps then hold = cycle modes / presence / colour (for Solid, Blink, Breathe, Comet, Pulse, Knight Rider).<br>"
         "Tap gap: max pause between taps. Hold: press length that starts a cycle. "
         "Step: time per item while holding. Beep 0 = silent. "
+        "Active level: Low if the module's LED is lit when not touched. "
         "Applies immediately, no reboot.</p>"));
   cardEnd();
  
@@ -1706,20 +1718,22 @@ static void handleRosterClear(){
   clearRoster();
   server.sendHeader("Location","/"); server.send(302);
 }
+static void touchPinInit();   // touch section, below
 static void handleSaveTouch(){
   if (server.hasArg("defaults")){
     setTouchCfg(DEFAULT_TOUCH_DEBOUNCE_MS, DEFAULT_TOUCH_GAP_MS, DEFAULT_TOUCH_HOLD_MS,
-                DEFAULT_TOUCH_STEP_MS, DEFAULT_BEEP_MS);
+                DEFAULT_TOUCH_STEP_MS, DEFAULT_BEEP_MS, true);
   } else {
     // Missing fields keep their current value.
     auto arg = [](const char* k, long cur){ return server.hasArg(k) ? server.arg(k).toInt() : cur; };
     setTouchCfg(arg("debounce", gTouchDebounceMs), arg("gap", gTouchGapMs), arg("hold", gTouchHoldMs),
-                arg("step", gTouchStepMs), arg("beep", gBeepMs));
+                arg("step", gTouchStepMs), arg("beep", gBeepMs), arg("active", gTouchActiveHigh ? 1 : 0) != 0);
   }
   saveTouchCfg();
-  Serial.printf("[TOUCH] cfg debounce=%u gap=%u hold=%u step=%u beep=%u\n",
+  touchPinInit();
+  Serial.printf("[TOUCH] cfg debounce=%u gap=%u hold=%u step=%u beep=%u active=%s\n",
     (unsigned)gTouchDebounceMs, (unsigned)gTouchGapMs, (unsigned)gTouchHoldMs,
-    (unsigned)gTouchStepMs, (unsigned)gBeepMs);
+    (unsigned)gTouchStepMs, (unsigned)gBeepMs, gTouchActiveHigh ? "high" : "low");
   server.sendHeader("Location","/advanced"); server.send(302);
 }
 static uint32_t hexArg(const char* k, uint32_t cur){
@@ -1904,15 +1918,25 @@ static void cycleApply(TouchCycle c, int i){
     if (currentEffect==PULSE) pulseResetRequested = true;
   }
 }
+// Pull the pin to the "not touched" level so an unplugged module stays idle,
+// and restart gesture tracking (used at boot and when the active level changes).
+static void touchPinInit(){
+  pinMode(TOUCH_PIN, gTouchActiveHigh ? INPUT_PULLDOWN : INPUT_PULLUP);
+  delay(2);
+  const bool raw = (digitalRead(TOUCH_PIN) == (gTouchActiveHigh ? HIGH : LOW));
+  touchRaw = touchStable = raw; touchRawMs = millis();
+  tapCount = 0; touchCycle = TC_NONE;
+}
 static void serviceTouch(){
   const uint32_t now = millis();
   // Remember the last "on" mode from any source (web, AIO, touch) for the Ring tap.
   if (powerState && currentEffect!=OFF) lastOnEffect = currentEffect;
   // Debounce: accept a new level only after it has been stable for gTouchDebounceMs.
-  const bool raw = (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE);
+  const bool raw = (digitalRead(TOUCH_PIN) == (gTouchActiveHigh ? HIGH : LOW));
   if (raw != touchRaw){ touchRaw = raw; touchRawMs = now; }
   if (raw != touchStable && (now - touchRawMs) >= gTouchDebounceMs){
     touchStable = raw;
+    Serial.printf("[TOUCH] %s (pin %s)\n", touchStable ? "down" : "up", digitalRead(TOUCH_PIN) ? "HIGH" : "LOW");
     if (touchStable){
       touchDownMs = now;
     } else if (touchCycle != TC_NONE){            // release ends a cycle: keep it
@@ -1967,8 +1991,7 @@ void setup(){
   }
  
   initStrip();
-  // Pulldown keeps the pin LOW if the module is unplugged (module drives it when present)
-  pinMode(TOUCH_PIN, INPUT_PULLDOWN);
+  touchPinInit();
   currentColor = RGB(255,0,0);
   setAllPixels(0);
   float tempV; rgbToHsv(currentColor, targetHue, targetSaturation, tempV);
