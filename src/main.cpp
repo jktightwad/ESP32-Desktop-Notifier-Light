@@ -1909,9 +1909,11 @@ static volatile uint8_t  buzzLen = 0, buzzPos = 0;
 
 static void buzzerWrite(bool on){ digitalWrite(BUZZER_PIN, on ? HIGH : LOW); }
 static void buzzTimerCb(void*){
-  if (++buzzPos >= buzzLen){ buzzerWrite(false); return; }
-  buzzerWrite((buzzPos & 1) == 0);   // even steps = on
-  esp_timer_start_once(buzzTimer, (uint64_t)buzzSeq[buzzPos] * 1000ULL);
+  const uint8_t pos = buzzPos + 1;   // explicit read/write: ++ on volatile is deprecated in C++20
+  buzzPos = pos;
+  if (pos >= buzzLen){ buzzerWrite(false); return; }
+  buzzerWrite((pos & 1) == 0);       // even steps = on
+  esp_timer_start_once(buzzTimer, (uint64_t)buzzSeq[pos] * 1000ULL);
 }
 static void buzzerInit(){
   pinMode(BUZZER_PIN, OUTPUT); buzzerWrite(false);
